@@ -107,7 +107,7 @@ func orderSupportTools() []catalog.Tool {
 			Auth:        "bearer",
 			TimeoutMS:   3000,
 			Enabled:     true,
-			Parameters:  json.RawMessage(`{"type":"object","additionalProperties":false,"required":["order_id","reason"],"properties":{"order_id":{"type":"string"},"reason":{"type":"string"}}}`),
+			Parameters:  json.RawMessage(`{"type":"object","additionalProperties":false,"required":["order_id","reason","customer_id"],"properties":{"order_id":{"type":"string"},"reason":{"type":"string"},"customer_id":{"type":"string"}}}`),
 			Response:    json.RawMessage(`{"keep":["refund_id","status"]}`),
 			Requires:    []string{"get_order_status"},
 		},
@@ -206,7 +206,10 @@ func TestRun_statusQuestionGroundsReplyFromOrderTool(t *testing.T) {
 	}
 	first := model.toolCalls[0]
 	if first.System != attempt.ToolCallingSystemPrompt {
-		t.Error("tool-calling prompt must match foundation brief")
+		t.Error("tool-calling prompt must use ToolCallingSystemPrompt")
+	}
+	if !strings.Contains(strings.ToLower(first.System), "explicit") {
+		t.Error("tool-calling prompt must include the explicit-request rule")
 	}
 	if len(first.Tools) != 2 {
 		t.Fatalf("function schemas = %d, want 2 enabled tools", len(first.Tools))
@@ -431,5 +434,284 @@ func TestRun_generalAnswerSkipsToolCallingPrompt(t *testing.T) {
 	}
 	if len(cat.toolsForCalls) != 0 {
 		t.Fatalf("tools must not load without skills, calls=%#v", cat.toolsForCalls)
+	}
+}
+
+func TestRun_refundAfterSuccessfulStatusReadCompletes(t *testing.T) {
+	cat := &toolAwareCatalog{
+		skills: []catalog.Skill{orderSupportCandidate()},
+		tools:  orderSupportTools(),
+	}
+	model := &scriptedModel{
+		selectionJSON: `{"intent":"refund","skill_names":["order_support"],"reason":"explicit refund"}`,
+		toolResponses: []attempt.ToolCallingResult{
+			{
+				ToolCalls: []attempt.ToolCall{{
+					ID:        "call_1",
+					Name:      "get_order_status",
+					Arguments: json.RawMessage(`{"order_id":"1001"}`),
+				}},
+			},
+			{
+				ToolCalls: []attempt.ToolCall{{
+					ID:        "call_2",
+					Name:      "refund_order",
+					Arguments: json.RawMessage(`{"order_id":"1001","reason":"customer requested"}`),
+				}},
+			},
+			{Reply: "Refund rf_9 for order 1001 is pending."},
+		},
+	}
+	api := &recordingOrderAPI{
+		bodies: []json.RawMessage{
+			json.RawMessage(`{"order_id":"1001","status":"shipped","carrier":"UPS"}`),
+			json.RawMessage(`{"refund_id":"rf_9","status":"pending"}`),
+		},
+		latency: 50,
+	}
+	a, _ := newReactAttempt(t, cat, model, api)
+
+	in := validInput()
+	in.Content = "Please refund order 1001"
+	result, err := a.Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := result.Output
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	if result.DeadLetter != nil {
+		t.Fatalf("unexpected dead letter: %+v", result.DeadLetter)
+	}
+	if len(api.requests) != 2 {
+		t.Fatalf("HTTP requests = %d, want 2 (status then refund)", len(api.requests))
+	}
+	if api.requests[0].Name != "get_order_status" {
+		t.Errorf("first HTTP = %q, want get_order_status", api.requests[0].Name)
+	}
+	if api.requests[1].Name != "refund_order" {
+		t.Errorf("second HTTP = %q, want refund_order", api.requests[1].Name)
+	}
+	if len(out.UsedTools) != 2 {
+		t.Fatalf("used_tools = %#v, want 2", out.UsedTools)
+	}
+	if out.UsedTools[0].Name != "get_order_status" || out.UsedTools[0].Status != "ok" {
+		t.Errorf("used_tools[0] = %#v", out.UsedTools[0])
+	}
+	if out.UsedTools[1].Name != "refund_order" || out.UsedTools[1].Status != "ok" {
+		t.Errorf("used_tools[1] = %#v", out.UsedTools[1])
+	}
+	if !strings.Contains(out.Reply, "rf_9") || !strings.Contains(out.Reply, "1001") {
+		t.Errorf("reply = %q, want grounded refund facts", out.Reply)
+	}
+	if out.Error != nil {
+		t.Errorf("error want nil, got %+v", out.Error)
+	}
+}
+
+func TestRun_refundWithoutRequiredReadRefusesHTTP(t *testing.T) {
+	cat := &toolAwareCatalog{
+		skills: []catalog.Skill{orderSupportCandidate()},
+		tools:  orderSupportTools(),
+	}
+	model := &scriptedModel{
+		selectionJSON: `{"intent":"refund","skill_names":["order_support"],"reason":"refund"}`,
+		toolResponses: []attempt.ToolCallingResult{
+			{
+				ToolCalls: []attempt.ToolCall{{
+					ID:        "call_1",
+					Name:      "refund_order",
+					Arguments: json.RawMessage(`{"order_id":"1001","reason":"customer requested"}`),
+				}},
+			},
+			{Reply: "I could not complete the refund without checking the order first."},
+		},
+	}
+	api := &recordingOrderAPI{
+		body:    json.RawMessage(`{"refund_id":"rf_should_not_run","status":"pending"}`),
+		latency: 10,
+	}
+	a, _ := newReactAttempt(t, cat, model, api)
+
+	in := validInput()
+	in.Content = "Please refund order 1001"
+	result, err := a.Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := result.Output
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	if len(api.requests) != 0 {
+		t.Fatalf("HTTP must not run without required read, got %#v", api.requests)
+	}
+	if len(out.UsedTools) != 1 {
+		t.Fatalf("used_tools = %#v, want 1 error", out.UsedTools)
+	}
+	if out.UsedTools[0].Name != "refund_order" || out.UsedTools[0].Status != "error" {
+		t.Errorf("used_tools[0] = %#v, want refund_order error", out.UsedTools[0])
+	}
+}
+
+func TestRun_customerIDBoundFromMessageNotModel(t *testing.T) {
+	cat := &toolAwareCatalog{
+		skills: []catalog.Skill{orderSupportCandidate()},
+		tools:  orderSupportTools(),
+	}
+	model := &scriptedModel{
+		selectionJSON: `{"intent":"refund","skill_names":["order_support"],"reason":"refund"}`,
+		toolResponses: []attempt.ToolCallingResult{
+			{
+				ToolCalls: []attempt.ToolCall{{
+					ID:        "call_1",
+					Name:      "get_order_status",
+					Arguments: json.RawMessage(`{"order_id":"1001"}`),
+				}},
+			},
+			{
+				ToolCalls: []attempt.ToolCall{{
+					ID:   "call_2",
+					Name: "refund_order",
+					// Model tries to act as another customer; executor must ignore this.
+					Arguments: json.RawMessage(`{"order_id":"1001","reason":"requested","customer_id":"cus_OTHER"}`),
+				}},
+			},
+			{Reply: "Refund rf_1 for order 1001 is pending."},
+		},
+	}
+	api := &recordingOrderAPI{
+		bodies: []json.RawMessage{
+			json.RawMessage(`{"order_id":"1001","status":"shipped","carrier":"UPS"}`),
+			json.RawMessage(`{"refund_id":"rf_1","status":"pending"}`),
+		},
+		latency: 20,
+	}
+	a, _ := newReactAttempt(t, cat, model, api)
+
+	in := validInput()
+	in.CustomerID = "cus_456"
+	in.Content = "Please refund order 1001"
+	if _, err := a.Run(context.Background(), in); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(model.toolCalls) < 1 {
+		t.Fatal("expected tool-calling schemas")
+	}
+	var refundSchema *attempt.FunctionSchema
+	for i := range model.toolCalls[0].Tools {
+		if model.toolCalls[0].Tools[i].Name == "refund_order" {
+			refundSchema = &model.toolCalls[0].Tools[i]
+			break
+		}
+	}
+	if refundSchema == nil {
+		t.Fatal("refund_order schema missing")
+	}
+	if strings.Contains(string(refundSchema.Parameters), "customer_id") {
+		t.Errorf("model schema must omit customer_id, got %s", refundSchema.Parameters)
+	}
+
+	if len(api.requests) != 2 {
+		t.Fatalf("HTTP requests = %d, want 2", len(api.requests))
+	}
+	refundReq := api.requests[1]
+	if refundReq.Name != "refund_order" {
+		t.Fatalf("second request = %#v", refundReq)
+	}
+	var args map[string]any
+	if err := json.Unmarshal(refundReq.Arguments, &args); err != nil {
+		t.Fatalf("unmarshal refund args: %v", err)
+	}
+	if args["customer_id"] != "cus_456" {
+		t.Errorf("customer_id = %v, want message cus_456 (not model-supplied)", args["customer_id"])
+	}
+}
+
+func TestRun_toolCallingPromptIncludesExplicitRequestRule(t *testing.T) {
+	cat := &toolAwareCatalog{
+		skills: []catalog.Skill{orderSupportCandidate()},
+		tools:  orderSupportTools()[:1],
+	}
+	model := &scriptedModel{
+		selectionJSON: `{"intent":"order_status","skill_names":["order_support"],"reason":"status"}`,
+		toolResponses: []attempt.ToolCallingResult{
+			{Reply: "Thanks."},
+		},
+	}
+	api := &recordingOrderAPI{}
+	a, _ := newReactAttempt(t, cat, model, api)
+
+	if _, err := a.Run(context.Background(), validInput()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(model.toolCalls) != 1 {
+		t.Fatalf("tool calls = %d", len(model.toolCalls))
+	}
+	sys := model.toolCalls[0].System
+	if sys != attempt.ToolCallingSystemPrompt {
+		t.Error("system prompt must be ToolCallingSystemPrompt")
+	}
+	lower := strings.ToLower(sys)
+	if !strings.Contains(lower, "explicit") || !strings.Contains(lower, "write") {
+		t.Errorf("tool-calling prompt must state write tools need an explicit request, got %q", sys)
+	}
+}
+
+func TestRun_executorAllowsWriteRegardlessOfStatusValue(t *testing.T) {
+	cat := &toolAwareCatalog{
+		skills: []catalog.Skill{orderSupportCandidate()},
+		tools:  orderSupportTools(),
+	}
+	model := &scriptedModel{
+		selectionJSON: `{"intent":"refund","skill_names":["order_support"],"reason":"refund"}`,
+		toolResponses: []attempt.ToolCallingResult{
+			{
+				ToolCalls: []attempt.ToolCall{{
+					ID:        "call_1",
+					Name:      "get_order_status",
+					Arguments: json.RawMessage(`{"order_id":"1001"}`),
+				}},
+			},
+			{
+				ToolCalls: []attempt.ToolCall{{
+					ID:        "call_2",
+					Name:      "refund_order",
+					Arguments: json.RawMessage(`{"order_id":"1001","reason":"customer requested"}`),
+				}},
+			},
+			{Reply: "Refund rf_in_transit for order 1001 is pending."},
+		},
+	}
+	api := &recordingOrderAPI{
+		bodies: []json.RawMessage{
+			// Executor must not refuse the write based on this status string.
+			json.RawMessage(`{"order_id":"1001","status":"in_transit","carrier":"UPS"}`),
+			json.RawMessage(`{"refund_id":"rf_in_transit","status":"pending"}`),
+		},
+		latency: 15,
+	}
+	a, _ := newReactAttempt(t, cat, model, api)
+
+	in := validInput()
+	in.Content = "Please refund order 1001"
+	result, err := a.Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := result.Output
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	if len(api.requests) != 2 {
+		t.Fatalf("HTTP requests = %#v, want status then refund (no status-based refusal)", api.requests)
+	}
+	if api.requests[1].Name != "refund_order" {
+		t.Errorf("second HTTP = %q", api.requests[1].Name)
+	}
+	if len(out.UsedTools) != 2 || out.UsedTools[1].Status != "ok" {
+		t.Errorf("used_tools = %#v", out.UsedTools)
 	}
 }
