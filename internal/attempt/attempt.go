@@ -55,12 +55,15 @@ Rules:
 - Do not invent a skill name.
 - Do not include a customer-facing reply, a tool name, or an endpoint.`
 
-// ToolCallingSystemPrompt is the foundation brief tool-calling system prompt.
+// ToolCallingSystemPrompt is the foundation brief tool-calling system prompt,
+// plus the explicit-request rule for write tools (ADR 0001 / ADR 0008).
 const ToolCallingSystemPrompt = `You are the support agent for this conversation. Answer the latest customer message.
 
 Use a tool when the reply depends on order, account, or refund facts. Those facts must come from a tool result. If a tool fails, say what you could not complete and do not guess the missing fact.
 
-When the chosen skills do not contain a tool that can answer, say you cannot look that up. Do not invent a tool.`
+When the chosen skills do not contain a tool that can answer, say you cannot look that up. Do not invent a tool.
+
+Only call a write tool (one that changes account state) when the latest customer message explicitly asks for that change. Do not call a write tool from implied intent or a complaint alone.`
 
 // SkillCandidate is name and description only for selection (no tool endpoints or parameters).
 type SkillCandidate struct {
@@ -285,6 +288,7 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 	messages := buildToolCallingMessages(in)
 	usedTools := make([]contract.UsedTool, 0)
 	keeps := make([]map[string]any, 0)
+	succeeded := make(map[string]struct{})
 	executions := 0
 
 	for {
@@ -360,13 +364,37 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 				continue
 			}
 
+			args := bindCustomerID(tool.Parameters, tc.Arguments, in.CustomerID)
+
+			if missing := unmetRequires(tool.Requires, succeeded); len(missing) > 0 {
+				executions++
+				observation := fmt.Sprintf(`{"error":"required tools not successful in this attempt: %s"}`, strings.Join(missing, ", "))
+				usedTools = append(usedTools, contract.UsedTool{
+					Name:      tool.Name,
+					Status:    "error",
+					LatencyMs: 0,
+				})
+				messages = append(messages,
+					TranscriptMessage{
+						Role:    "assistant",
+						Content: fmt.Sprintf("tool_call %s %s", tc.Name, string(args)),
+					},
+					TranscriptMessage{
+						Role:    "tool",
+						Name:    tool.Name,
+						Content: observation,
+					},
+				)
+				continue
+			}
+
 			executions++
-			endpoint := substituteEndpoint(tool.Endpoint, tc.Arguments)
+			endpoint := substituteEndpoint(tool.Endpoint, args)
 			httpRes := a.deps.Tools.Execute(ctx, ToolHTTPRequest{
 				Name:      tool.Name,
 				Method:    tool.Method,
 				Endpoint:  endpoint,
-				Arguments: tc.Arguments,
+				Arguments: args,
 			})
 
 			status := "ok"
@@ -386,6 +414,10 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 				}
 			}
 
+			if status == "ok" {
+				succeeded[tool.Name] = struct{}{}
+			}
+
 			usedTools = append(usedTools, contract.UsedTool{
 				Name:      tool.Name,
 				Status:    status,
@@ -394,7 +426,7 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 			messages = append(messages,
 				TranscriptMessage{
 					Role:    "assistant",
-					Content: fmt.Sprintf("tool_call %s %s", tc.Name, string(tc.Arguments)),
+					Content: fmt.Sprintf("tool_call %s %s", tc.Name, string(args)),
 				},
 				TranscriptMessage{
 					Role:    "tool",
@@ -453,6 +485,8 @@ func buildFunctionSchemas(tools []catalog.Tool) []FunctionSchema {
 		params := tool.Parameters
 		if params == nil {
 			params = json.RawMessage(`{}`)
+		} else {
+			params = omitCustomerIDFromSchema(params)
 		}
 		out = append(out, FunctionSchema{
 			Name:        tool.Name,
@@ -461,6 +495,82 @@ func buildFunctionSchemas(tools []catalog.Tool) []FunctionSchema {
 		})
 	}
 	return out
+}
+
+// omitCustomerIDFromSchema strips customer_id from the model-facing JSON Schema (ADR 0009).
+func omitCustomerIDFromSchema(params json.RawMessage) json.RawMessage {
+	var schema map[string]any
+	if err := json.Unmarshal(params, &schema); err != nil {
+		return params
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if props == nil {
+		return params
+	}
+	if _, ok := props["customer_id"]; !ok {
+		return params
+	}
+	delete(props, "customer_id")
+	schema["properties"] = props
+	if req, ok := schema["required"].([]any); ok {
+		filtered := make([]any, 0, len(req))
+		for _, item := range req {
+			if s, ok := item.(string); ok && s == "customer_id" {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		schema["required"] = filtered
+	}
+	out, err := json.Marshal(schema)
+	if err != nil {
+		return params
+	}
+	return out
+}
+
+// parametersDeclareCustomerID reports whether the catalog schema includes customer_id.
+func parametersDeclareCustomerID(params json.RawMessage) bool {
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(params, &schema); err != nil {
+		return false
+	}
+	_, ok := schema.Properties["customer_id"]
+	return ok
+}
+
+// bindCustomerID inserts the message customer_id when the tool declares that property.
+// A model-supplied customer_id is overwritten (ADR 0009).
+func bindCustomerID(params, args json.RawMessage, customerID string) json.RawMessage {
+	if !parametersDeclareCustomerID(params) {
+		return args
+	}
+	var m map[string]any
+	if len(args) == 0 {
+		m = map[string]any{}
+	} else if err := json.Unmarshal(args, &m); err != nil {
+		m = map[string]any{}
+	}
+	m["customer_id"] = customerID
+	out, err := json.Marshal(m)
+	if err != nil {
+		return args
+	}
+	return out
+}
+
+// unmetRequires returns required tool names that have not succeeded in this attempt.
+// A successful required read is enough; status values are not interpreted (ADR 0007).
+func unmetRequires(requires []string, succeeded map[string]struct{}) []string {
+	var missing []string
+	for _, name := range requires {
+		if _, ok := succeeded[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 func buildToolCallingMessages(in contract.InputMessage) []TranscriptMessage {

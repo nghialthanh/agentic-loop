@@ -84,7 +84,7 @@ func SeedOrderSupport(ctx context.Context, db *sql.DB) error {
 			updated_at = now()
 	`,
 		skillID,
-		`{"type":"object","additionalProperties":false,"required":["order_id","reason"],"properties":{"order_id":{"type":"string"},"reason":{"type":"string"}}}`,
+		`{"type":"object","additionalProperties":false,"required":["order_id","reason","customer_id"],"properties":{"order_id":{"type":"string"},"reason":{"type":"string"},"customer_id":{"type":"string"}}}`,
 		`{"keep":["refund_id","status"]}`,
 	)
 	if err != nil {
