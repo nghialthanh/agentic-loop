@@ -3,15 +3,43 @@ package attempt_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agentic-loop/worker/internal/attempt"
+	"github.com/agentic-loop/worker/internal/catalog"
 	"github.com/agentic-loop/worker/internal/contract"
 )
 
-type fakeCatalog struct{}
-type fakeModel struct{}
+type fakeCatalog struct {
+	skills      []catalog.Skill
+	searchCalls int
+	lastQuery   string
+}
+
+func (c *fakeCatalog) SearchSkills(_ context.Context, query string) ([]catalog.Skill, error) {
+	c.searchCalls++
+	c.lastQuery = query
+	out := make([]catalog.Skill, len(c.skills))
+	copy(out, c.skills)
+	return out, nil
+}
+
+func (c *fakeCatalog) ToolsForSkills(_ context.Context, _ []string) ([]catalog.Tool, error) {
+	return nil, nil
+}
+
+type fakeModel struct {
+	selectionJSON string
+	calls         []attempt.SkillSelectionCall
+}
+
+func (m *fakeModel) SelectSkills(_ context.Context, call attempt.SkillSelectionCall) (string, error) {
+	m.calls = append(m.calls, call)
+	return m.selectionJSON, nil
+}
+
 type fakeTools struct{}
 
 type recordingStore struct {
@@ -27,12 +55,20 @@ type fakeClock struct{ now time.Time }
 
 func (c fakeClock) Now() time.Time { return c.now }
 
-func newAttempt(t *testing.T, store attempt.Store) *attempt.Attempt {
+func orderSupportCandidate() catalog.Skill {
+	return catalog.Skill{
+		Name:        "order_support",
+		Description: "Order status and refunds for a customer order",
+		Enabled:     true,
+	}
+}
+
+func newAttemptWith(t *testing.T, cat attempt.Catalog, model attempt.Model, store attempt.Store) *attempt.Attempt {
 	t.Helper()
 	fixed := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 	return attempt.New(attempt.Deps{
-		Catalog: fakeCatalog{},
-		Model:   fakeModel{},
+		Catalog: cat,
+		Model:   model,
 		Tools:   fakeTools{},
 		Store:   store,
 		Clock:   fakeClock{now: fixed},
@@ -53,7 +89,9 @@ func validInput() contract.InputMessage {
 
 func TestRun_validMessageReturnsWellFormedOutput(t *testing.T) {
 	store := &recordingStore{}
-	a := newAttempt(t, store)
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `{"intent":"general","skill_names":[],"reason":"none"}`}
+	a := newAttemptWith(t, cat, model, store)
 
 	in := validInput()
 	result, err := a.Run(context.Background(), in)
@@ -96,9 +134,139 @@ func TestRun_validMessageReturnsWellFormedOutput(t *testing.T) {
 	}
 }
 
+func TestRun_emptySkillNamesProducesGeneralReply(t *testing.T) {
+	store := &recordingStore{}
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `{"intent":"greeting","skill_names":[],"reason":"no skill fits"}`}
+	a := newAttemptWith(t, cat, model, store)
+
+	result, err := a.Run(context.Background(), validInput())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := result.Output
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	if result.DeadLetter != nil {
+		t.Fatalf("unexpected dead letter: %+v", result.DeadLetter)
+	}
+	assertGeneralAnswer(t, out)
+	if out.Intent != "greeting" {
+		t.Errorf("intent = %q, want greeting", out.Intent)
+	}
+	if containsAccountFact(out.Reply) {
+		t.Errorf("reply invents account facts: %q", out.Reply)
+	}
+}
+
+func TestRun_invalidSelectionJSONTreatedAsNoSkillMatch(t *testing.T) {
+	store := &recordingStore{}
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `not-json{{{`}
+	a := newAttemptWith(t, cat, model, store)
+
+	result, err := a.Run(context.Background(), validInput())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := result.Output
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	assertGeneralAnswer(t, out)
+	if out.Intent != "" {
+		t.Errorf("intent = %q, want empty on decode failure", out.Intent)
+	}
+}
+
+func TestRun_nonCandidateSkillNamesAreDropped(t *testing.T) {
+	store := &recordingStore{}
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{
+		selectionJSON: `{"intent":"order_status","skill_names":["order_support","invented_skill"],"reason":"status"}`,
+	}
+	a := newAttemptWith(t, cat, model, store)
+
+	result, err := a.Run(context.Background(), validInput())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := result.Output
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	if len(out.Skills) != 1 || out.Skills[0] != "order_support" {
+		t.Errorf("skills = %v, want [order_support]", out.Skills)
+	}
+	for _, name := range out.Skills {
+		if name == "invented_skill" {
+			t.Error("invented_skill must be dropped")
+		}
+	}
+}
+
+func TestRun_onlyNonCandidateNamesYieldsGeneralReply(t *testing.T) {
+	store := &recordingStore{}
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{
+		selectionJSON: `{"intent":"other","skill_names":["invented_skill"],"reason":"guess"}`,
+	}
+	a := newAttemptWith(t, cat, model, store)
+
+	result, err := a.Run(context.Background(), validInput())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertGeneralAnswer(t, result.Output)
+}
+
+func TestRun_selectionCallSeesOnlyCandidatesWithoutTools(t *testing.T) {
+	store := &recordingStore{}
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `{"intent":"general","skill_names":[],"reason":"none"}`}
+	a := newAttemptWith(t, cat, model, store)
+
+	in := validInput()
+	if _, err := a.Run(context.Background(), in); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(model.calls) != 1 {
+		t.Fatalf("SelectSkills calls = %d, want 1 (no retry)", len(model.calls))
+	}
+	call := model.calls[0]
+	if call.System != attempt.SkillSelectionSystemPrompt {
+		t.Errorf("system prompt does not match foundation brief")
+	}
+	if call.HasToolSchemas {
+		t.Error("selection call must not attach tool schemas")
+	}
+	if len(call.Candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(call.Candidates))
+	}
+	c := call.Candidates[0]
+	if c.Name != "order_support" {
+		t.Errorf("candidate name = %q", c.Name)
+	}
+	if c.Description == "" {
+		t.Error("candidate description required")
+	}
+	if !strings.Contains(call.User, in.Content) {
+		t.Errorf("user prompt missing latest content")
+	}
+	if !strings.Contains(call.User, "- order_support: ") {
+		t.Errorf("user prompt missing candidate list line, got %q", call.User)
+	}
+	if cat.searchCalls != 1 {
+		t.Errorf("SearchSkills calls = %d, want 1", cat.searchCalls)
+	}
+}
+
 func TestRun_emptyContentAfterTrimGoesToDeadLetterOnly(t *testing.T) {
 	store := &recordingStore{}
-	a := newAttempt(t, store)
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `{"intent":"general","skill_names":[],"reason":"none"}`}
+	a := newAttemptWith(t, cat, model, store)
 
 	in := validInput()
 	in.Content = "   \t\n"
@@ -111,11 +279,16 @@ func TestRun_emptyContentAfterTrimGoesToDeadLetterOnly(t *testing.T) {
 	if len(store.claims) != 0 {
 		t.Fatalf("dedupe/claim writes = %v, want none", store.claims)
 	}
+	if len(model.calls) != 0 {
+		t.Fatalf("model must not be called for dead letter, calls=%d", len(model.calls))
+	}
 }
 
 func TestRun_unknownHistoryRoleGoesToDeadLetterOnly(t *testing.T) {
 	store := &recordingStore{}
-	a := newAttempt(t, store)
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `{"intent":"general","skill_names":[],"reason":"none"}`}
+	a := newAttemptWith(t, cat, model, store)
 
 	in := validInput()
 	in.ConversationHistory = []contract.HistoryTurn{
@@ -134,7 +307,9 @@ func TestRun_unknownHistoryRoleGoesToDeadLetterOnly(t *testing.T) {
 
 func TestRunBytes_schemaInvalidGoesToDeadLetterOnly(t *testing.T) {
 	store := &recordingStore{}
-	a := newAttempt(t, store)
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `{"intent":"general","skill_names":[],"reason":"none"}`}
+	a := newAttemptWith(t, cat, model, store)
 
 	raw := []byte(`{"message_id":123,"conversation_id":"conv_123"}`)
 
@@ -166,7 +341,9 @@ func TestRunBytes_schemaInvalidGoesToDeadLetterOnly(t *testing.T) {
 
 func TestRunBytes_missingRequiredFieldGoesToDeadLetterOnly(t *testing.T) {
 	store := &recordingStore{}
-	a := newAttempt(t, store)
+	cat := &fakeCatalog{skills: []catalog.Skill{orderSupportCandidate()}}
+	model := &fakeModel{selectionJSON: `{"intent":"general","skill_names":[],"reason":"none"}`}
+	a := newAttemptWith(t, cat, model, store)
 
 	raw := []byte(`{
   "message_id": "msg_01JABC",
@@ -200,6 +377,49 @@ func TestRunBytes_missingRequiredFieldGoesToDeadLetterOnly(t *testing.T) {
 	if len(store.claims) != 0 {
 		t.Fatalf("dedupe/claim writes = %v, want none", store.claims)
 	}
+}
+
+func assertGeneralAnswer(t *testing.T, out *contract.OutputMessage) {
+	t.Helper()
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	if out.Reply == "" {
+		t.Error("reply must be non-empty")
+	}
+	if out.Reply != attempt.GeneralReply {
+		t.Errorf("reply = %q, want general reply", out.Reply)
+	}
+	if out.Skills == nil || len(out.Skills) != 0 {
+		t.Errorf("skills = %v, want empty", out.Skills)
+	}
+	if out.UsedTools == nil || len(out.UsedTools) != 0 {
+		t.Errorf("used_tools = %v, want empty", out.UsedTools)
+	}
+	if out.Confidence > 0.2 {
+		t.Errorf("confidence = %v, want low (<=0.2)", out.Confidence)
+	}
+	if out.Error != nil {
+		t.Errorf("error want nil, got %+v", out.Error)
+	}
+}
+
+func containsAccountFact(reply string) bool {
+	lower := strings.ToLower(reply)
+	markers := []string{
+		"order 1001",
+		"shipped",
+		"refund",
+		"balance",
+		"cus_456",
+		"status is",
+	}
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func assertDeadLetterOnly(t *testing.T, result attempt.Result, wantPayload contract.InputMessage, wantReason string) {
