@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -20,8 +21,11 @@ type Model interface{}
 // Tools calls tool HTTP APIs. Ticket 01 uses a stub behind this seam.
 type Tools interface{}
 
-// Store holds dedupe, claims, and rate limits. Ticket 01 uses a stub behind this seam.
-type Store interface{}
+// Store holds dedupe, claims, and rate limits.
+// ClaimMessage is the only operation this ticket asserts; full claim semantics arrive later.
+type Store interface {
+	ClaimMessage(ctx context.Context, messageID string) error
+}
 
 // Clock provides the current time for attempts.
 type Clock interface {
@@ -53,16 +57,48 @@ type Result struct {
 	DeadLetter *contract.DeadLetter
 }
 
-// Run processes one message through the attempt seam.
-// Ticket 01 returns a stub reply for valid input; full pipeline comes later.
+// Run processes one typed message through the attempt seam.
+// Malformed input returns a dead letter and never claims the message.
 func (a *Attempt) Run(ctx context.Context, in contract.InputMessage) (Result, error) {
-	_ = ctx
-	_ = a.deps
-
 	if reason := validateInput(in); reason != "" {
 		return Result{
 			DeadLetter: &contract.DeadLetter{Payload: in, Reason: reason},
 		}, nil
+	}
+	return a.runValid(ctx, in)
+}
+
+// RunBytes unmarshals a Kafka JSON payload and runs the attempt.
+// Schema-invalid JSON becomes a dead letter with the original payload; no claim is written.
+func (a *Attempt) RunBytes(ctx context.Context, payload []byte) (Result, error) {
+	var in contract.InputMessage
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return Result{
+			DeadLetter: &contract.DeadLetter{
+				Payload: json.RawMessage(append([]byte(nil), payload...)),
+				Reason:  "schema validation failed: " + err.Error(),
+			},
+		}, nil
+	}
+	if reason := validateInput(in); reason != "" {
+		return Result{
+			DeadLetter: &contract.DeadLetter{
+				Payload: json.RawMessage(append([]byte(nil), payload...)),
+				Reason:  reason,
+			},
+		}, nil
+	}
+	return a.runValid(ctx, in)
+}
+
+func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Result, error) {
+	_ = a.deps.Catalog
+	_ = a.deps.Model
+	_ = a.deps.Tools
+	_ = a.deps.Clock
+
+	if err := a.deps.Store.ClaimMessage(ctx, in.MessageID); err != nil {
+		return Result{}, fmt.Errorf("claim message: %w", err)
 	}
 
 	traceID, err := newTraceID()
