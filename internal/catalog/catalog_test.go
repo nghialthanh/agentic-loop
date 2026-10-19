@@ -16,13 +16,20 @@ import (
 var testDB *sql.DB
 
 func TestMain(m *testing.M) {
+	runtimePath, err := os.MkdirTemp("", "catalog-pg-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "temp dir: %v\n", err)
+		os.Exit(1)
+	}
 	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
 		Username("catalog").
 		Password("catalog").
 		Database("catalog").
-		Port(5433))
+		Port(5433).
+		RuntimePath(runtimePath))
 	if err := pg.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "start postgres: %v\n", err)
+		_ = os.RemoveAll(runtimePath)
 		os.Exit(1)
 	}
 
@@ -30,6 +37,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open db: %v\n", err)
 		_ = pg.Stop()
+		_ = os.RemoveAll(runtimePath)
 		os.Exit(1)
 	}
 	testDB = db
@@ -37,6 +45,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = db.Close()
 	_ = pg.Stop()
+	_ = os.RemoveAll(runtimePath)
 	os.Exit(code)
 }
 

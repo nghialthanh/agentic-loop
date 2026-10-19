@@ -12,6 +12,7 @@ import (
 
 	"github.com/agentic-loop/worker/internal/catalog"
 	"github.com/agentic-loop/worker/internal/contract"
+	"github.com/agentic-loop/worker/internal/store"
 )
 
 // GeneralReply is the customer-facing text when no skill matches.
@@ -23,6 +24,9 @@ const LowConfidence = 0.2
 
 // GroundedConfidence is used when the reply is backed by successful tool keep fields.
 const GroundedConfidence = 0.8
+
+// RateLimitedReply is the fixed customer-facing text when over the rate limit.
+const RateLimitedReply = store.RateLimitedReply
 
 // MaxToolExecutions caps tool HTTP calls per attempt.
 const MaxToolExecutions = 4
@@ -154,10 +158,11 @@ type Tools interface {
 	Execute(ctx context.Context, req ToolHTTPRequest) ToolHTTPResponse
 }
 
-// Store holds dedupe, claims, and rate limits.
-// ClaimMessage is the only operation this ticket asserts; full claim semantics arrive later.
+// Store holds dedupe, claims, and rate limits in the shared catalog database.
 type Store interface {
-	ClaimMessage(ctx context.Context, messageID string) error
+	Claim(ctx context.Context, messageID string, now time.Time) (store.ClaimResult, error)
+	SaveOutput(ctx context.Context, out contract.OutputMessage) error
+	ReserveRateLimit(ctx context.Context, customerID, messageID string, now time.Time) (ok bool, err error)
 }
 
 // Clock provides the current time for attempts.
@@ -225,15 +230,41 @@ func (a *Attempt) RunBytes(ctx context.Context, payload []byte) (Result, error) 
 }
 
 func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Result, error) {
-	_ = a.deps.Clock
+	now := a.deps.Clock.Now()
 
-	if err := a.deps.Store.ClaimMessage(ctx, in.MessageID); err != nil {
+	claim, err := a.deps.Store.Claim(ctx, in.MessageID, now)
+	if err != nil {
 		return Result{}, fmt.Errorf("claim message: %w", err)
 	}
+	switch claim.Outcome {
+	case store.ClaimStored:
+		if claim.Stored == nil {
+			return Result{}, fmt.Errorf("claim stored without output")
+		}
+		return Result{Output: claim.Stored}, nil
+	case store.ClaimHeld:
+		return Result{}, store.ErrClaimHeld
+	case store.ClaimWon:
+		// continue
+	default:
+		return Result{}, fmt.Errorf("unknown claim outcome %v", claim.Outcome)
+	}
 
+	ok, err := a.deps.Store.ReserveRateLimit(ctx, in.CustomerID, in.MessageID, now)
+	if err != nil {
+		return Result{}, fmt.Errorf("rate limit: %w", err)
+	}
 	traceID, err := newTraceID()
 	if err != nil {
 		return Result{}, fmt.Errorf("trace id: %w", err)
+	}
+
+	if !ok {
+		out := rateLimitedOutput(in, traceID)
+		if err := a.deps.Store.SaveOutput(ctx, out); err != nil {
+			return Result{}, fmt.Errorf("store rate-limited output: %w", err)
+		}
+		return Result{Output: &out}, nil
 	}
 
 	candidates, err := a.deps.Catalog.SearchSkills(ctx, in.Content)
@@ -246,28 +277,49 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 		return Result{}, err
 	}
 
+	var out *contract.OutputMessage
 	if len(skills) == 0 {
-		return Result{
-			Output: &contract.OutputMessage{
-				MessageID:      in.MessageID,
-				ConversationID: in.ConversationID,
-				Reply:          GeneralReply,
-				Intent:         intent,
-				Skills:         []string{},
-				UsedTools:      []contract.UsedTool{},
-				Confidence:     LowConfidence,
-				Error:          nil,
-				TraceID:        traceID,
-				Model:          "",
-			},
-		}, nil
+		out = &contract.OutputMessage{
+			MessageID:      in.MessageID,
+			ConversationID: in.ConversationID,
+			Reply:          GeneralReply,
+			Intent:         intent,
+			Skills:         []string{},
+			UsedTools:      []contract.UsedTool{},
+			Confidence:     LowConfidence,
+			Error:          nil,
+			TraceID:        traceID,
+			Model:          "",
+		}
+	} else {
+		out, err = a.runToolLoop(ctx, in, intent, skills, traceID)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
-	out, err := a.runToolLoop(ctx, in, intent, skills, traceID)
-	if err != nil {
-		return Result{}, err
+	if err := a.deps.Store.SaveOutput(ctx, *out); err != nil {
+		return Result{}, fmt.Errorf("store output: %w", err)
 	}
 	return Result{Output: out}, nil
+}
+
+func rateLimitedOutput(in contract.InputMessage, traceID string) contract.OutputMessage {
+	return contract.OutputMessage{
+		MessageID:      in.MessageID,
+		ConversationID: in.ConversationID,
+		Reply:          RateLimitedReply,
+		Intent:         "",
+		Skills:         []string{},
+		UsedTools:      []contract.UsedTool{},
+		Confidence:     LowConfidence,
+		Error: &contract.OutputError{
+			Code:    "rate_limited",
+			Message: "customer rate limit exceeded",
+		},
+		TraceID: traceID,
+		Model:   "",
+	}
 }
 
 func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, intent string, skills []string, traceID string) (*contract.OutputMessage, error) {

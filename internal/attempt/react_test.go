@@ -116,15 +116,15 @@ func orderSupportTools() []catalog.Tool {
 
 func newReactAttempt(t *testing.T, cat attempt.Catalog, model attempt.Model, tools attempt.Tools) (*attempt.Attempt, *recordingStore) {
 	t.Helper()
-	store := &recordingStore{}
+	rec := newRecordingStore()
 	fixed := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 	return attempt.New(attempt.Deps{
 		Catalog: cat,
 		Model:   model,
 		Tools:   tools,
-		Store:   store,
+		Store:   rec,
 		Clock:   fakeClock{now: fixed},
-	}), store
+	}), rec
 }
 
 func TestRun_statusQuestionGroundsReplyFromOrderTool(t *testing.T) {
