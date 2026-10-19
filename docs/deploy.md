@@ -8,6 +8,9 @@ Build from the repo root:
 docker build -t agentic-loop-worker .
 docker run --rm -p 8080:8080 \
   -e KAFKA_BROKERS=kafka:9092 \
+  -e DATABASE_URL=postgres://worker:worker@db:5432/worker?sslmode=disable \
+  -e MODEL_BASE_URL=https://api.openai.com/v1 \
+  -e MODEL_API_KEY=sk-... \
   -e TOOL_BEARER_TOKEN=secret \
   -e MODEL=gpt-4o-mini \
   agentic-loop-worker
@@ -19,11 +22,13 @@ The process exposes `GET /health` and `GET /metrics` on `HTTP_ADDR` (default `:8
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `KAFKA_BROKERS` | Yes (for consuming) | Comma-separated Kafka broker addresses. If unset, only the health/metrics HTTP server runs. |
+| `KAFKA_BROKERS` | Yes (for consuming) | Comma-separated Kafka broker addresses. If unset, only the health/metrics HTTP server runs (no Kafka/DB/model adapters). |
 | `HTTP_ADDR` | No | Listen address for health and metrics (default `:8080`). |
+| `DATABASE_URL` | Yes (when consuming) | Postgres URL for the skill catalog, dedupe claims, and per-customer rate limits. Shared across replicas. Required whenever `KAFKA_BROKERS` is set. |
+| `MODEL_BASE_URL` | Yes (when consuming) | OpenAI-compatible API base URL (e.g. `https://api.openai.com/v1`). Required whenever `KAFKA_BROKERS` is set. |
+| `MODEL_API_KEY` | No | Bearer token for the model HTTP API when the provider requires it. |
 | `TOOL_BEARER_TOKEN` | Yes (when calling bearer tools) | Shared bearer credential for catalog tools with `auth: bearer`. Never stored in the skill catalog. |
-| `MODEL` | Recommended | Model id for skill selection and tool-calling (temperature `0`). |
-| `DATABASE_URL` | Yes (production) | Postgres URL for the skill catalog, dedupe claims, and per-customer rate limits. Shared across replicas. |
+| `MODEL` | Recommended | Model id written on outputs when the model was called; also sent to the provider (temperature `0`). |
 
 Kafka topic and group names are fixed in code: input `chat.customer.messages`, output `chat.agent.replies`, DLQ `chat.customer.messages.dlq`, consumer group `agentic-loop`.
 

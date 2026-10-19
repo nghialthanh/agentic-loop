@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/agentic-loop/worker/internal/attempt"
+	"github.com/agentic-loop/worker/internal/contract"
 )
 
 // Runner runs one inbound Kafka payload through the attempt seam.
@@ -62,6 +63,9 @@ func (w *Worker) Handle(ctx context.Context, rec Record) error {
 			key = messageIDFromPayload(result.DeadLetter.Payload)
 		}
 	case result.Output != nil:
+		if err := contract.ValidateOutput(*result.Output); err != nil {
+			return fmt.Errorf("refuse invalid output: %w", err)
+		}
 		topic = TopicOutput
 		key = result.Output.MessageID
 		value, err = json.Marshal(result.Output)

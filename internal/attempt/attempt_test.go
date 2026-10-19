@@ -262,9 +262,6 @@ func TestRun_selectionCallSeesOnlyCandidatesWithoutTools(t *testing.T) {
 	if call.System != attempt.SkillSelectionSystemPrompt {
 		t.Errorf("system prompt does not match foundation brief")
 	}
-	if call.HasToolSchemas {
-		t.Error("selection call must not attach tool schemas")
-	}
 	if len(call.Candidates) != 1 {
 		t.Fatalf("candidates = %d, want 1", len(call.Candidates))
 	}
@@ -275,11 +272,11 @@ func TestRun_selectionCallSeesOnlyCandidatesWithoutTools(t *testing.T) {
 	if c.Description == "" {
 		t.Error("candidate description required")
 	}
-	if !strings.Contains(call.User, in.Content) {
-		t.Errorf("user prompt missing latest content")
+	if !strings.Contains(call.Customer, in.Content) {
+		t.Errorf("customer prompt missing latest content")
 	}
-	if !strings.Contains(call.User, "- order_support: ") {
-		t.Errorf("user prompt missing candidate list line, got %q", call.User)
+	if !strings.Contains(call.Customer, "- order_support: ") {
+		t.Errorf("customer prompt missing candidate list line, got %q", call.Customer)
 	}
 	if cat.searchCalls != 1 {
 		t.Errorf("SearchSkills calls = %d, want 1", cat.searchCalls)

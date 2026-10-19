@@ -198,9 +198,6 @@ func TestRun_statusQuestionGroundsReplyFromOrderTool(t *testing.T) {
 	if len(model.selectionCalls) != 1 {
 		t.Fatalf("selection calls = %d", len(model.selectionCalls))
 	}
-	if model.selectionCalls[0].HasToolSchemas {
-		t.Error("selection must not attach tool schemas")
-	}
 	if len(model.toolCalls) < 1 {
 		t.Fatal("expected tool-calling model calls")
 	}

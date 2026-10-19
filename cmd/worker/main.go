@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
 	"net/http"
 	"os"
@@ -14,8 +15,12 @@ import (
 	"github.com/agentic-loop/worker/internal/catalog"
 	"github.com/agentic-loop/worker/internal/health"
 	kafkaworker "github.com/agentic-loop/worker/internal/kafka"
+	"github.com/agentic-loop/worker/internal/model"
 	"github.com/agentic-loop/worker/internal/observability"
 	"github.com/agentic-loop/worker/internal/store"
+	"github.com/agentic-loop/worker/internal/tools"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func main() {
@@ -55,14 +60,44 @@ func main() {
 		brokers[i] = strings.TrimSpace(brokers[i])
 	}
 
-	// Catalog / model / tools adapters are wired in later tickets; memory store
-	// is enough for the Kafka consumer loop to run against a broker.
+	dbURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL is required when KAFKA_BROKERS is set")
+	}
+	modelBase := strings.TrimSpace(os.Getenv("MODEL_BASE_URL"))
+	if modelBase == "" {
+		log.Fatal("MODEL_BASE_URL is required when KAFKA_BROKERS is set")
+	}
+
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		log.Fatalf("ping database: %v", err)
+	}
+	if err := catalog.Migrate(ctx, db); err != nil {
+		log.Fatalf("catalog migrate: %v", err)
+	}
+	if err := store.Migrate(ctx, db); err != nil {
+		log.Fatalf("store migrate: %v", err)
+	}
+
+	modelName := strings.TrimSpace(os.Getenv("MODEL"))
 	a := attempt.New(attempt.Deps{
-		Catalog:   noopCatalog{},
-		Model:     noopModel{},
-		Tools:     noopTools{},
-		Store:     store.NewMemory(),
+		Catalog: catalog.NewRepository(db),
+		Model: &model.OpenAI{
+			BaseURL: modelBase,
+			APIKey:  strings.TrimSpace(os.Getenv("MODEL_API_KEY")),
+			Model:   modelName,
+		},
+		Tools: &tools.HTTPExecutor{
+			BearerToken: strings.TrimSpace(os.Getenv("TOOL_BEARER_TOKEN")),
+		},
+		Store:     store.NewPostgres(db),
 		Clock:     systemClock{},
+		ModelName: modelName,
 		Telemetry: tel,
 	})
 	bus := kafkaworker.NewKafkaBus(brokers, kafkaworker.GroupID)
@@ -76,30 +111,6 @@ func main() {
 	if err := consumer.Run(ctx); err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
-}
-
-type noopCatalog struct{}
-
-func (noopCatalog) SearchSkills(context.Context, string) ([]catalog.Skill, error) {
-	return nil, nil
-}
-func (noopCatalog) ToolsForSkills(context.Context, []string) ([]catalog.Tool, error) {
-	return nil, nil
-}
-
-type noopModel struct{}
-
-func (noopModel) SelectSkills(context.Context, attempt.SkillSelectionCall) (string, error) {
-	return `{"intent":"general","skill_names":[],"reason":"none"}`, nil
-}
-func (noopModel) CallWithTools(context.Context, attempt.ToolCallingCall) (attempt.ToolCallingResult, error) {
-	return attempt.ToolCallingResult{Reply: attempt.GeneralReply}, nil
-}
-
-type noopTools struct{}
-
-func (noopTools) Execute(context.Context, attempt.ToolHTTPRequest) attempt.ToolHTTPResponse {
-	return attempt.ToolHTTPResponse{}
 }
 
 type systemClock struct{}

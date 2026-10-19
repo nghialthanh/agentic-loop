@@ -42,6 +42,10 @@ const RateLimitedReply = store.RateLimitedReply
 // MaxToolExecutions caps tool HTTP calls per attempt.
 const MaxToolExecutions = 4
 
+// MaxPlannerRounds caps tool-calling model rounds so unmet-requires / invalid-arg
+// refusals (which do not count as HTTP executions) cannot loop forever.
+const MaxPlannerRounds = 16
+
 // MessageBudget is the default per-message timeout budget (spec Further Notes).
 const MessageBudget = 30 * time.Second
 
@@ -103,10 +107,9 @@ type SkillCandidate struct {
 
 // SkillSelectionCall is what the attempt sends to the model for skill selection.
 type SkillSelectionCall struct {
-	System         string
-	User           string
-	Candidates     []SkillCandidate
-	HasToolSchemas bool
+	System     string
+	Customer   string // customer-facing transcript + candidates (glossary: Customer, not user)
+	Candidates []SkillCandidate
 }
 
 // FunctionSchema is one OpenAI-style function definition built from a catalog tool.
@@ -151,6 +154,8 @@ type ToolHTTPRequest struct {
 	Method    string
 	Endpoint  string
 	Arguments json.RawMessage
+	Auth      string // catalog auth scheme (e.g. bearer)
+	TimeoutMS int    // per-tool timeout, already capped by remaining message budget
 }
 
 // ToolHTTPResponse is the raw HTTP outcome (no keep-field normalization).
@@ -208,6 +213,7 @@ type Deps struct {
 	Tools     Tools
 	Store     Store
 	Clock     Clock
+	ModelName string                   // from config/env MODEL; set on output when the model was called
 	Telemetry *observability.Telemetry // optional; nil skips logs/metrics/traces
 }
 
@@ -293,7 +299,8 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 		return Result{}, fmt.Errorf("trace id: %w", err)
 	}
 
-	start := time.Now()
+	attemptStart := a.deps.Clock.Now()
+	wallStart := time.Now()
 	ctx, fields, endSpan := a.deps.Telemetry.BeginAttempt(ctx, in.MessageID, in.ConversationID, traceID)
 	var (
 		out           *contract.OutputMessage
@@ -303,7 +310,7 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 	)
 	defer func() {
 		m := observability.AttemptMetrics{
-			Latency:       time.Since(start),
+			Latency:       time.Since(wallStart),
 			Tokens:        tokens,
 			Hallucination: hallucination,
 		}
@@ -356,13 +363,20 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 		return Result{}, runErr
 	}
 
+	budget := newMessageBudget(attemptStart, a.deps.Clock)
 	intent, skills, selTokens, err := a.selectSkills(ctx, in, candidates)
 	tokens += selTokens
 	if err != nil {
-		runErr = err
-		return Result{}, runErr
+		noReply := failureOutput(in, traceID, a.deps.ModelName, intent, nil, nil, budget.exhausted(), err.Error())
+		if saveErr := a.deps.Store.SaveOutput(ctx, noReply); saveErr != nil {
+			runErr = fmt.Errorf("store no_reply output: %w", saveErr)
+			return Result{}, runErr
+		}
+		out = &noReply
+		return Result{Output: out, Tokens: tokens}, nil
 	}
 
+	modelName := a.deps.ModelName
 	if len(skills) == 0 {
 		out = &contract.OutputMessage{
 			MessageID:      in.MessageID,
@@ -374,13 +388,14 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 			Confidence:     LowConfidence,
 			Error:          nil,
 			TraceID:        traceID,
-			Model:          "",
+			Model:          modelName,
 		}
 	} else {
 		var loopTokens int
-		out, loopTokens, hallucination, err = a.runToolLoop(ctx, in, intent, skills, traceID)
+		out, loopTokens, hallucination, err = a.runToolLoop(ctx, in, intent, skills, traceID, modelName, budget)
 		tokens += loopTokens
 		if err != nil {
+			// Adapter/infra errors only (model failures are stored inside runToolLoop).
 			runErr = err
 			return Result{}, runErr
 		}
@@ -391,6 +406,72 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 		return Result{}, runErr
 	}
 	return Result{Output: out, Tokens: tokens, Hallucination: hallucination}, nil
+}
+
+// messageBudget tracks wall-clock remaining time from attempt start (default 30s).
+// Reported tool latencies advance the budget when the clock does not move (tests).
+type messageBudget struct {
+	start    time.Time
+	clock    Clock
+	extra    time.Duration // synthetic elapsed (tool LatencyMs when clock is frozen)
+	deadline time.Duration
+}
+
+func newMessageBudget(start time.Time, clock Clock) *messageBudget {
+	return &messageBudget{start: start, clock: clock, deadline: MessageBudget}
+}
+
+func (b *messageBudget) remaining() time.Duration {
+	elapsed := b.clock.Now().Sub(b.start) + b.extra
+	rem := b.deadline - elapsed
+	if rem < 0 {
+		return 0
+	}
+	return rem
+}
+
+func (b *messageBudget) exhausted() bool {
+	return b.remaining() <= 0
+}
+
+func (b *messageBudget) observe(wall, reportedLatency time.Duration) {
+	step := wall
+	if reportedLatency > step {
+		step = reportedLatency
+	}
+	// When the clock already advanced by wall, only credit synthetic latency beyond wall.
+	if reportedLatency > wall {
+		b.extra += reportedLatency - wall
+	}
+}
+
+func failureOutput(in contract.InputMessage, traceID, model, intent string, skills []string, used []contract.UsedTool, timedOut bool, detail string) contract.OutputMessage {
+	if skills == nil {
+		skills = []string{}
+	}
+	if used == nil {
+		used = []contract.UsedTool{}
+	}
+	code := "no_reply"
+	msg := "model failure"
+	if timedOut {
+		code = "timeout"
+		msg = "message budget spent"
+	} else if detail != "" {
+		msg = detail
+	}
+	return contract.OutputMessage{
+		MessageID:      in.MessageID,
+		ConversationID: in.ConversationID,
+		Reply:          TimeoutReply,
+		Intent:         intent,
+		Skills:         skills,
+		UsedTools:      used,
+		Confidence:     LowConfidence,
+		Error:          &contract.OutputError{Code: code, Message: msg},
+		TraceID:        traceID,
+		Model:          model,
+	}
 }
 
 func rateLimitedOutput(in contract.InputMessage, traceID string) contract.OutputMessage {
@@ -411,7 +492,7 @@ func rateLimitedOutput(in contract.InputMessage, traceID string) contract.Output
 	}
 }
 
-func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, intent string, skills []string, traceID string) (*contract.OutputMessage, int, bool, error) {
+func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, intent string, skills []string, traceID, modelName string, budget *messageBudget) (*contract.OutputMessage, int, bool, error) {
 	tools, err := a.deps.Catalog.ToolsForSkills(ctx, skills)
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("load tools: %w", err)
@@ -428,12 +509,12 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 	keeps := make([]map[string]any, 0)
 	succeeded := make(map[string]struct{})
 	executions := 0
-	remainingMs := MessageBudget.Milliseconds()
+	plannerRounds := 0
 	tokens := 0
 	hallucinated := false
 
-	finish := func(reply string, timedOut, hitToolCap bool) *contract.OutputMessage {
-		if !timedOut && inventsAccountFacts(reply, in.Content, keeps) {
+	finish := func(reply string, timedOut bool) *contract.OutputMessage {
+		if !timedOut && inventsAccountFacts(reply, keeps) {
 			hallucinated = true
 		}
 		missing := missingRequestedAccountFact(in.Content, keeps)
@@ -445,7 +526,7 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 			reply = TimeoutReply
 			outErr = &contract.OutputError{Code: "timeout", Message: "message budget spent"}
 		case missing:
-			reply = composeMissingFactReply(reply, in.Content, keeps)
+			reply = composeMissingFactReply(reply, keeps)
 			outErr = &contract.OutputError{Code: "tool_failed", Message: "requested account fact missing"}
 		default:
 			reply = composeGroundedReply(reply, keeps)
@@ -453,7 +534,6 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 				confidence = GroundedConfidence
 			}
 		}
-		_ = hitToolCap
 		return &contract.OutputMessage{
 			MessageID:      in.MessageID,
 			ConversationID: in.ConversationID,
@@ -464,28 +544,35 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 			Confidence:     confidence,
 			Error:          outErr,
 			TraceID:        traceID,
-			Model:          "",
+			Model:          modelName,
 		}
 	}
 
 	for {
-		if remainingMs <= 0 {
-			return finish("", true, false), tokens, hallucinated, nil
+		if budget.exhausted() {
+			return finish("", true), tokens, hallucinated, nil
 		}
+		if plannerRounds >= MaxPlannerRounds {
+			return finish("I looked into that with the tools I could run.", false), tokens, hallucinated, nil
+		}
+		plannerRounds++
 
 		call := ToolCallingCall{
 			System:   ToolCallingSystemPrompt,
 			Messages: messages,
 			Tools:    schemas,
 		}
+		before := a.deps.Clock.Now()
 		result, err := a.deps.Model.CallWithTools(ctx, call)
+		budget.observe(a.deps.Clock.Now().Sub(before), 0)
 		if err != nil {
-			return nil, tokens, false, fmt.Errorf("call with tools: %w", err)
+			out := failureOutput(in, traceID, modelName, intent, skills, usedTools, budget.exhausted(), err.Error())
+			return &out, tokens, hallucinated, nil
 		}
 		tokens += tokenUsage(result, call)
 
 		if len(result.ToolCalls) == 0 {
-			return finish(result.Reply, false, false), tokens, hallucinated, nil
+			return finish(result.Reply, false), tokens, hallucinated, nil
 		}
 
 		if executions >= MaxToolExecutions {
@@ -493,15 +580,15 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 			if strings.TrimSpace(reply) == "" {
 				reply = "I looked into that with the tools I could run."
 			}
-			return finish(reply, false, true), tokens, hallucinated, nil
+			return finish(reply, false), tokens, hallucinated, nil
 		}
 
 		for _, tc := range result.ToolCalls {
 			if executions >= MaxToolExecutions {
 				break
 			}
-			if remainingMs <= 0 {
-				return finish("", true, false), tokens, hallucinated, nil
+			if budget.exhausted() {
+				return finish("", true), tokens, hallucinated, nil
 			}
 
 			tool, ok := byName[tc.Name]
@@ -522,7 +609,7 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 			args := bindCustomerID(tool.Parameters, tc.Arguments, in.CustomerID)
 
 			if missing := unmetRequires(tool.Requires, succeeded); len(missing) > 0 {
-				executions++
+				// Unmet requires do not count toward the four-tool HTTP execution cap.
 				observation := fmt.Sprintf(`{"error":"required tools not successful in this attempt: %s"}`, strings.Join(missing, ", "))
 				usedTools = append(usedTools, contract.UsedTool{
 					Name:      tool.Name,
@@ -543,14 +630,53 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 				continue
 			}
 
+			if err := validateArgsAgainstSchema(tool.Parameters, args); err != nil {
+				observation := fmt.Sprintf(`{"error":%q}`, err.Error())
+				usedTools = append(usedTools, contract.UsedTool{
+					Name:      tool.Name,
+					Status:    "error",
+					LatencyMs: 0,
+				})
+				messages = append(messages,
+					TranscriptMessage{
+						Role:    "assistant",
+						Content: fmt.Sprintf("tool_call %s %s", tc.Name, string(args)),
+					},
+					TranscriptMessage{
+						Role:    "tool",
+						Name:    tool.Name,
+						Content: observation,
+					},
+				)
+				continue
+			}
+
+			rem := budget.remaining()
+			toolTimeout := tool.TimeoutMS
+			if toolTimeout <= 0 {
+				toolTimeout = 3000
+			}
+			if maxMS := int(rem.Milliseconds()); maxMS > 0 && toolTimeout > maxMS {
+				toolTimeout = maxMS
+			}
+
 			executions++
 			endpoint := substituteEndpoint(tool.Endpoint, args)
+			beforeTool := a.deps.Clock.Now()
 			httpRes := a.deps.Tools.Execute(ctx, ToolHTTPRequest{
 				Name:      tool.Name,
 				Method:    tool.Method,
 				Endpoint:  endpoint,
 				Arguments: args,
+				Auth:      tool.Auth,
+				TimeoutMS: toolTimeout,
 			})
+			wall := a.deps.Clock.Now().Sub(beforeTool)
+			lat := time.Duration(httpRes.LatencyMs) * time.Millisecond
+			if lat < 0 {
+				lat = 0
+			}
+			budget.observe(wall, lat)
 
 			status := "ok"
 			var observation string
@@ -568,12 +694,6 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 					observation = string(raw)
 				}
 			}
-
-			latency := httpRes.LatencyMs
-			if latency < 0 {
-				latency = 0
-			}
-			remainingMs -= int64(latency)
 
 			if status == "ok" {
 				succeeded[tool.Name] = struct{}{}
@@ -596,8 +716,8 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 				},
 			)
 
-			if remainingMs <= 0 {
-				return finish("", true, false), tokens, hallucinated, nil
+			if budget.exhausted() {
+				return finish("", true), tokens, hallucinated, nil
 			}
 		}
 	}
@@ -615,17 +735,16 @@ func (a *Attempt) selectSkills(ctx context.Context, in contract.InputMessage, ca
 	}
 
 	call := SkillSelectionCall{
-		System:         SkillSelectionSystemPrompt,
-		User:           buildSelectionUserPrompt(in, candViews),
-		Candidates:     candViews,
-		HasToolSchemas: false,
+		System:     SkillSelectionSystemPrompt,
+		Customer:   buildSelectionCustomerPrompt(in, candViews),
+		Candidates: candViews,
 	}
 
 	raw, err := a.deps.Model.SelectSkills(ctx, call)
 	if err != nil {
 		return "", nil, 0, fmt.Errorf("select skills: %w", err)
 	}
-	tokens = estimateTextTokens(call.System) + estimateTextTokens(call.User) + estimateTextTokens(raw)
+	tokens = estimateTextTokens(call.System) + estimateTextTokens(call.Customer) + estimateTextTokens(raw)
 
 	var decoded selectionResult
 	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
@@ -916,40 +1035,20 @@ func missingRequestedAccountFact(content string, keeps []map[string]any) bool {
 	return len(keeps) == 0
 }
 
-func composeMissingFactReply(modelReply, content string, _ []map[string]any) string {
+func composeMissingFactReply(modelReply string, _ []map[string]any) string {
 	// Do not present unrelated keep values as the answer. Only allow an honest
 	// model failure sentence that invents no account-fact markers.
-	if strings.TrimSpace(modelReply) == "" || inventsAccountFacts(modelReply, content, nil) {
+	if strings.TrimSpace(modelReply) == "" || inventsAccountFacts(modelReply, nil) {
 		return ToolFailedReply
 	}
 	return modelReply
 }
 
-func inventsAccountFacts(reply, customerContent string, keeps []map[string]any) bool {
-	allowed := allowedFactValues(keeps)
-	for _, token := range tokenize(customerContent) {
-		if hasDigit(token) {
-			allowed[strings.ToLower(token)] = struct{}{}
-		}
-	}
-	lower := strings.ToLower(reply)
-	for _, word := range []string{"balance", "refund", "cancelled", "canceled", "shipped", "delivered", "pending"} {
-		if !strings.Contains(lower, word) {
-			continue
-		}
-		if _, ok := allowed[word]; !ok {
-			return true
-		}
-	}
-	for _, token := range tokenize(reply) {
-		if !hasDigit(token) {
-			continue
-		}
-		if _, ok := allowed[strings.ToLower(token)]; !ok {
-			return true
-		}
-	}
-	return false
+// accountFactMarkers are status/word tokens that must appear in successful tool keeps if used in a reply.
+var accountFactMarkers = []string{"balance", "refund", "cancelled", "canceled", "shipped", "delivered", "pending"}
+
+func inventsAccountFacts(reply string, keeps []map[string]any) bool {
+	return !replyGroundedInKeeps(reply, keeps)
 }
 
 func allowedFactValues(keeps []map[string]any) map[string]struct{} {
@@ -965,13 +1064,13 @@ func allowedFactValues(keeps []map[string]any) map[string]struct{} {
 	return allowed
 }
 
+// replyGroundedInKeeps reports whether every account-fact marker and digit token
+// in reply appears in successful tool keep values. Customer-message wording is
+// not a source of allowed account facts (ADR 0002 / glossary).
 func replyGroundedInKeeps(reply string, keeps []map[string]any) bool {
 	allowed := allowedFactValues(keeps)
 	lower := strings.ToLower(reply)
-
-	// Invented account-fact markers that must appear in keep values if used.
-	suspicious := []string{"balance", "refund", "cancelled", "canceled", "shipped", "delivered", "pending"}
-	for _, word := range suspicious {
+	for _, word := range accountFactMarkers {
 		if !strings.Contains(lower, word) {
 			continue
 		}
@@ -979,8 +1078,6 @@ func replyGroundedInKeeps(reply string, keeps []map[string]any) bool {
 			return false
 		}
 	}
-
-	// Any digit-run (order-like id) in the reply must be a keep value.
 	for _, token := range tokenize(reply) {
 		if !hasDigit(token) {
 			continue
@@ -1046,7 +1143,7 @@ func templateFromKeeps(keeps []map[string]any) string {
 	return strings.Join(parts, " ")
 }
 
-func buildSelectionUserPrompt(in contract.InputMessage, candidates []SkillCandidate) string {
+func buildSelectionCustomerPrompt(in contract.InputMessage, candidates []SkillCandidate) string {
 	var b strings.Builder
 	b.WriteString("Conversation:\n")
 	for _, turn := range in.ConversationHistory {

@@ -56,6 +56,30 @@ func (b *fakeBus) Commit(_ context.Context, messageID string) error {
 	return nil
 }
 
+func TestHandle_refusesInvalidOutputWithoutPublish(t *testing.T) {
+	out := &contract.OutputMessage{
+		MessageID:      "",
+		ConversationID: "conv_1",
+		Reply:          "bad",
+		Skills:         []string{},
+		UsedTools:      []contract.UsedTool{},
+		TraceID:        "trace_1",
+	}
+	runner := &fakeAttempt{result: attempt.Result{Output: out}}
+	bus := &fakeBus{}
+	w := kafkaworker.NewWorker(runner, bus)
+	err := w.Handle(context.Background(), kafkaworker.Record{Key: "msg", Payload: []byte(`{}`)})
+	if err == nil {
+		t.Fatal("expected refuse invalid output error")
+	}
+	if len(bus.published) != 0 {
+		t.Fatalf("published = %d, want 0", len(bus.published))
+	}
+	if len(bus.committed) != 0 {
+		t.Fatalf("committed = %d, want 0", len(bus.committed))
+	}
+}
+
 func TestHandle_happyPathPublishesOutputThenCommits(t *testing.T) {
 	out := &contract.OutputMessage{
 		MessageID:      "msg_happy",
