@@ -4,11 +4,15 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Go module exists and builds
-- [ ] Input and output message structs match the foundation schemas
-- [ ] Attempt seam is callable with fake catalog, model, tools, store, and clock
-- [ ] A valid message through the seam returns a well-formed output record (stub reply is enough)
-- [ ] Health endpoint responds successfully
-- [ ] Contract tests cover valid input and output shapes
+- [x] Go module exists and builds
+- [x] Input and output message structs match the foundation schemas
+- [x] Attempt seam is callable with fake catalog, model, tools, store, and clock
+- [x] A valid message through the seam returns a well-formed output record (stub reply is enough)
+- [x] Health endpoint responds successfully
+- [x] Contract tests cover valid input and output shapes
+
+## Answer
+
+Stub worker skeleton: foundation Kafka input/output structs in `internal/contract`, attempt seam with adapter deps and stub reply in `internal/attempt`, `GET /health` in `internal/health`, plus contract/attempt/health tests. Module builds; valid message through the seam returns a well-formed output.
