@@ -33,6 +33,7 @@ func (c *fakeCatalog) ToolsForSkills(_ context.Context, _ []string) ([]catalog.T
 type fakeModel struct {
 	selectionJSON string
 	calls         []attempt.SkillSelectionCall
+	toolCalls     []attempt.ToolCallingCall
 }
 
 func (m *fakeModel) SelectSkills(_ context.Context, call attempt.SkillSelectionCall) (string, error) {
@@ -40,7 +41,16 @@ func (m *fakeModel) SelectSkills(_ context.Context, call attempt.SkillSelectionC
 	return m.selectionJSON, nil
 }
 
+func (m *fakeModel) CallWithTools(_ context.Context, call attempt.ToolCallingCall) (attempt.ToolCallingResult, error) {
+	m.toolCalls = append(m.toolCalls, call)
+	return attempt.ToolCallingResult{Reply: "Thanks for your message. I'm looking into it."}, nil
+}
+
 type fakeTools struct{}
+
+func (fakeTools) Execute(_ context.Context, _ attempt.ToolHTTPRequest) attempt.ToolHTTPResponse {
+	return attempt.ToolHTTPResponse{}
+}
 
 type recordingStore struct {
 	claims []string

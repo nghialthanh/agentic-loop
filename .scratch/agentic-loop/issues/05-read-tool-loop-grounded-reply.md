@@ -4,13 +4,17 @@
 
 **Blocked by:** 04 (Skill selection and general answer)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Tool-calling prompt is used only after skills are accepted
-- [ ] Function schemas are built only from enabled tools of chosen skills
-- [ ] Successful `get_order_status` grounds order account facts in the reply
-- [ ] `used_tools` lists invocations in order with ok/error and latency
-- [ ] Reply does not invent account facts absent from successful tool results
-- [ ] History budget keeps newest turns and omits older turns for this call only
-- [ ] At most four tool executions per attempt
-- [ ] End-to-end test with mocked model and order API through the attempt seam
+- [x] Tool-calling prompt is used only after skills are accepted
+- [x] Function schemas are built only from enabled tools of chosen skills
+- [x] Successful `get_order_status` grounds order account facts in the reply
+- [x] `used_tools` lists invocations in order with ok/error and latency
+- [x] Reply does not invent account facts absent from successful tool results
+- [x] History budget keeps newest turns and omits older turns for this call only
+- [x] At most four tool executions per attempt
+- [x] End-to-end test with mocked model and order API through the attempt seam
+
+## Answer
+
+After accepted skills, the attempt loads enabled tools, builds function schemas, trims history (newest 12 then token budget with an omission line for this call only), and runs a bounded ReAct loop via `Model.CallWithTools` + `Tools.Execute` (max four HTTP executions). Successful `get_order_status` keep fields ground the reply; invented account facts are replaced from tool keeps. Covered by attempt-seam tests with a scripted model and recording order API.
