@@ -4,11 +4,15 @@
 
 **Blocked by:** 09 (Kafka consumer and publisher)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Logs carry `message_id`, `conversation_id`, and `trace_id` per attempt
-- [ ] A new `trace_id` is issued per attempt
-- [ ] Metrics expose latency, tool success, tokens, and hallucinations
-- [ ] PII redaction applies to logs and traces
-- [ ] Dockerfile builds a runnable image
-- [ ] Environment variables and replica scaling notes are documented
+- [x] Logs carry `message_id`, `conversation_id`, and `trace_id` per attempt
+- [x] A new `trace_id` is issued per attempt
+- [x] Metrics expose latency, tool success, tokens, and hallucinations
+- [x] PII redaction applies to logs and traces
+- [x] Dockerfile builds a runnable image
+- [x] Environment variables and replica scaling notes are documented
+
+## Answer
+
+`internal/observability` provides structured JSON logs (`message_id`, `conversation_id`, `trace_id`) with PII redaction, one OpenTelemetry `attempt` span per processing attempt, and `/metrics` for latency, tool success/error, tokens, and hallucinations. Attempt wires optional `Telemetry`; `cmd/worker` registers health+metrics. `Dockerfile` and `docs/deploy.md` cover env vars and horizontal replicas in group `agentic-loop`.

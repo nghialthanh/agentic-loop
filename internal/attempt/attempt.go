@@ -12,6 +12,7 @@ import (
 
 	"github.com/agentic-loop/worker/internal/catalog"
 	"github.com/agentic-loop/worker/internal/contract"
+	"github.com/agentic-loop/worker/internal/observability"
 	"github.com/agentic-loop/worker/internal/store"
 )
 
@@ -138,8 +139,10 @@ type ToolCallingCall struct {
 
 // ToolCallingResult is either a final reply or one or more tool calls.
 type ToolCallingResult struct {
-	Reply     string
-	ToolCalls []ToolCall
+	Reply            string
+	ToolCalls        []ToolCall
+	PromptTokens     int // optional; when zero the attempt estimates usage
+	CompletionTokens int
 }
 
 // ToolHTTPRequest is one outbound tool HTTP call.
@@ -200,11 +203,12 @@ type Clock interface {
 
 // Deps are adapters the attempt seam needs.
 type Deps struct {
-	Catalog Catalog
-	Model   Model
-	Tools   Tools
-	Store   Store
-	Clock   Clock
+	Catalog   Catalog
+	Model     Model
+	Tools     Tools
+	Store     Store
+	Clock     Clock
+	Telemetry *observability.Telemetry // optional; nil skips logs/metrics/traces
 }
 
 // Attempt is the primary seam: one inbound message in; one output or dead-letter out.
@@ -219,8 +223,10 @@ func New(deps Deps) *Attempt {
 
 // Result is either a normal output or a dead-letter record.
 type Result struct {
-	Output     *contract.OutputMessage
-	DeadLetter *contract.DeadLetter
+	Output        *contract.OutputMessage
+	DeadLetter    *contract.DeadLetter
+	Tokens        int  // estimated model tokens for this attempt (not published)
+	Hallucination bool // composer detected unsupported account facts
 }
 
 // Run processes one typed message through the attempt seam.
@@ -287,16 +293,44 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 		return Result{}, fmt.Errorf("trace id: %w", err)
 	}
 
-	if !ok {
-		out := rateLimitedOutput(in, traceID)
-		if err := a.deps.Store.SaveOutput(ctx, out); err != nil {
-			return Result{}, fmt.Errorf("store rate-limited output: %w", err)
+	start := time.Now()
+	ctx, fields, endSpan := a.deps.Telemetry.BeginAttempt(ctx, in.MessageID, in.ConversationID, traceID)
+	var (
+		out           *contract.OutputMessage
+		tokens        int
+		hallucination bool
+		runErr        error
+	)
+	defer func() {
+		m := observability.AttemptMetrics{
+			Latency:       time.Since(start),
+			Tokens:        tokens,
+			Hallucination: hallucination,
 		}
-		return Result{Output: &out}, nil
+		if out != nil {
+			for _, u := range out.UsedTools {
+				if u.Status == "ok" {
+					m.ToolOK++
+				} else {
+					m.ToolErr++
+				}
+			}
+		}
+		a.deps.Telemetry.FinishAttempt(fields, endSpan, runErr, m)
+	}()
+
+	if !ok {
+		rateOut := rateLimitedOutput(in, traceID)
+		if err := a.deps.Store.SaveOutput(ctx, rateOut); err != nil {
+			runErr = fmt.Errorf("store rate-limited output: %w", err)
+			return Result{}, runErr
+		}
+		out = &rateOut
+		return Result{Output: out}, nil
 	}
 
 	if guardBlocked(in.Content) {
-		out := contract.OutputMessage{
+		guardOut := contract.OutputMessage{
 			MessageID:      in.MessageID,
 			ConversationID: in.ConversationID,
 			Reply:          GuardRefusal,
@@ -308,23 +342,27 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 			TraceID:        traceID,
 			Model:          "",
 		}
-		if err := a.deps.Store.SaveOutput(ctx, out); err != nil {
-			return Result{}, fmt.Errorf("store guard output: %w", err)
+		if err := a.deps.Store.SaveOutput(ctx, guardOut); err != nil {
+			runErr = fmt.Errorf("store guard output: %w", err)
+			return Result{}, runErr
 		}
-		return Result{Output: &out}, nil
+		out = &guardOut
+		return Result{Output: out}, nil
 	}
 
 	candidates, err := a.deps.Catalog.SearchSkills(ctx, in.Content)
 	if err != nil {
-		return Result{}, fmt.Errorf("search skills: %w", err)
+		runErr = fmt.Errorf("search skills: %w", err)
+		return Result{}, runErr
 	}
 
-	intent, skills, err := a.selectSkills(ctx, in, candidates)
+	intent, skills, selTokens, err := a.selectSkills(ctx, in, candidates)
+	tokens += selTokens
 	if err != nil {
-		return Result{}, err
+		runErr = err
+		return Result{}, runErr
 	}
 
-	var out *contract.OutputMessage
 	if len(skills) == 0 {
 		out = &contract.OutputMessage{
 			MessageID:      in.MessageID,
@@ -339,16 +377,20 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 			Model:          "",
 		}
 	} else {
-		out, err = a.runToolLoop(ctx, in, intent, skills, traceID)
+		var loopTokens int
+		out, loopTokens, hallucination, err = a.runToolLoop(ctx, in, intent, skills, traceID)
+		tokens += loopTokens
 		if err != nil {
-			return Result{}, err
+			runErr = err
+			return Result{}, runErr
 		}
 	}
 
 	if err := a.deps.Store.SaveOutput(ctx, *out); err != nil {
-		return Result{}, fmt.Errorf("store output: %w", err)
+		runErr = fmt.Errorf("store output: %w", err)
+		return Result{}, runErr
 	}
-	return Result{Output: out}, nil
+	return Result{Output: out, Tokens: tokens, Hallucination: hallucination}, nil
 }
 
 func rateLimitedOutput(in contract.InputMessage, traceID string) contract.OutputMessage {
@@ -369,10 +411,10 @@ func rateLimitedOutput(in contract.InputMessage, traceID string) contract.Output
 	}
 }
 
-func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, intent string, skills []string, traceID string) (*contract.OutputMessage, error) {
+func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, intent string, skills []string, traceID string) (*contract.OutputMessage, int, bool, error) {
 	tools, err := a.deps.Catalog.ToolsForSkills(ctx, skills)
 	if err != nil {
-		return nil, fmt.Errorf("load tools: %w", err)
+		return nil, 0, false, fmt.Errorf("load tools: %w", err)
 	}
 
 	schemas := buildFunctionSchemas(tools)
@@ -387,8 +429,13 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 	succeeded := make(map[string]struct{})
 	executions := 0
 	remainingMs := MessageBudget.Milliseconds()
+	tokens := 0
+	hallucinated := false
 
 	finish := func(reply string, timedOut, hitToolCap bool) *contract.OutputMessage {
+		if !timedOut && inventsAccountFacts(reply, in.Content, keeps) {
+			hallucinated = true
+		}
 		missing := missingRequestedAccountFact(in.Content, keeps)
 		var outErr *contract.OutputError
 		confidence := LowConfidence
@@ -423,7 +470,7 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 
 	for {
 		if remainingMs <= 0 {
-			return finish("", true, false), nil
+			return finish("", true, false), tokens, hallucinated, nil
 		}
 
 		call := ToolCallingCall{
@@ -433,11 +480,12 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 		}
 		result, err := a.deps.Model.CallWithTools(ctx, call)
 		if err != nil {
-			return nil, fmt.Errorf("call with tools: %w", err)
+			return nil, tokens, false, fmt.Errorf("call with tools: %w", err)
 		}
+		tokens += tokenUsage(result, call)
 
 		if len(result.ToolCalls) == 0 {
-			return finish(result.Reply, false, false), nil
+			return finish(result.Reply, false, false), tokens, hallucinated, nil
 		}
 
 		if executions >= MaxToolExecutions {
@@ -445,7 +493,7 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 			if strings.TrimSpace(reply) == "" {
 				reply = "I looked into that with the tools I could run."
 			}
-			return finish(reply, false, true), nil
+			return finish(reply, false, true), tokens, hallucinated, nil
 		}
 
 		for _, tc := range result.ToolCalls {
@@ -453,7 +501,7 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 				break
 			}
 			if remainingMs <= 0 {
-				return finish("", true, false), nil
+				return finish("", true, false), tokens, hallucinated, nil
 			}
 
 			tool, ok := byName[tc.Name]
@@ -549,13 +597,13 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 			)
 
 			if remainingMs <= 0 {
-				return finish("", true, false), nil
+				return finish("", true, false), tokens, hallucinated, nil
 			}
 		}
 	}
 }
 
-func (a *Attempt) selectSkills(ctx context.Context, in contract.InputMessage, candidates []catalog.Skill) (intent string, skills []string, err error) {
+func (a *Attempt) selectSkills(ctx context.Context, in contract.InputMessage, candidates []catalog.Skill) (intent string, skills []string, tokens int, err error) {
 	candViews := make([]SkillCandidate, 0, len(candidates))
 	allowed := make(map[string]struct{}, len(candidates))
 	for _, s := range candidates {
@@ -575,13 +623,14 @@ func (a *Attempt) selectSkills(ctx context.Context, in contract.InputMessage, ca
 
 	raw, err := a.deps.Model.SelectSkills(ctx, call)
 	if err != nil {
-		return "", nil, fmt.Errorf("select skills: %w", err)
+		return "", nil, 0, fmt.Errorf("select skills: %w", err)
 	}
+	tokens = estimateTextTokens(call.System) + estimateTextTokens(call.User) + estimateTextTokens(raw)
 
 	var decoded selectionResult
 	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
 		// Undecodable selection JSON → no skill match.
-		return "", nil, nil
+		return "", nil, tokens, nil
 	}
 
 	filtered := make([]string, 0, len(decoded.SkillNames))
@@ -590,7 +639,29 @@ func (a *Attempt) selectSkills(ctx context.Context, in contract.InputMessage, ca
 			filtered = append(filtered, name)
 		}
 	}
-	return decoded.Intent, filtered, nil
+	return decoded.Intent, filtered, tokens, nil
+}
+
+func tokenUsage(result ToolCallingResult, call ToolCallingCall) int {
+	if result.PromptTokens+result.CompletionTokens > 0 {
+		return result.PromptTokens + result.CompletionTokens
+	}
+	n := estimateTextTokens(call.System)
+	for _, m := range call.Messages {
+		n += estimateTextTokens(m.Content) + estimateTextTokens(m.Name)
+	}
+	n += estimateTextTokens(result.Reply)
+	for _, tc := range result.ToolCalls {
+		n += estimateTextTokens(tc.Name) + estimateTextTokens(string(tc.Arguments))
+	}
+	return n
+}
+
+func estimateTextTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	return (len(s) + 3) / 4
 }
 
 func buildFunctionSchemas(tools []catalog.Tool) []FunctionSchema {

@@ -1,6 +1,10 @@
 package health
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/agentic-loop/worker/internal/observability"
+)
 
 // Register mounts the health endpoint on mux.
 func Register(mux *http.ServeMux) {
@@ -8,4 +12,12 @@ func Register(mux *http.ServeMux) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+}
+
+// RegisterAll mounts /health and /metrics (when metrics is non-nil).
+func RegisterAll(mux *http.ServeMux, metrics *observability.Metrics) {
+	Register(mux)
+	if metrics != nil {
+		metrics.Register(mux)
+	}
 }

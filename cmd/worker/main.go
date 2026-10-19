@@ -14,19 +14,27 @@ import (
 	"github.com/agentic-loop/worker/internal/catalog"
 	"github.com/agentic-loop/worker/internal/health"
 	kafkaworker "github.com/agentic-loop/worker/internal/kafka"
+	"github.com/agentic-loop/worker/internal/observability"
 	"github.com/agentic-loop/worker/internal/store"
 )
 
 func main() {
+	tel := observability.NewDefault()
+
 	mux := http.NewServeMux()
-	health.Register(mux)
+	health.RegisterAll(mux, tel.Metrics)
+
+	addr := strings.TrimSpace(os.Getenv("HTTP_ADDR"))
+	if addr == "" {
+		addr = ":8080"
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		log.Println("listening on :8080")
-		server := &http.Server{Addr: ":8080", Handler: mux}
+		log.Printf("listening on %s", addr)
+		server := &http.Server{Addr: addr, Handler: mux}
 		go func() {
 			<-ctx.Done()
 			_ = server.Shutdown(context.Background())
@@ -38,7 +46,7 @@ func main() {
 
 	brokersEnv := strings.TrimSpace(os.Getenv("KAFKA_BROKERS"))
 	if brokersEnv == "" {
-		log.Println("KAFKA_BROKERS unset; health server only")
+		log.Println("KAFKA_BROKERS unset; health/metrics server only")
 		<-ctx.Done()
 		return
 	}
@@ -50,11 +58,12 @@ func main() {
 	// Catalog / model / tools adapters are wired in later tickets; memory store
 	// is enough for the Kafka consumer loop to run against a broker.
 	a := attempt.New(attempt.Deps{
-		Catalog: noopCatalog{},
-		Model:   noopModel{},
-		Tools:   noopTools{},
-		Store:   store.NewMemory(),
-		Clock:   systemClock{},
+		Catalog:   noopCatalog{},
+		Model:     noopModel{},
+		Tools:     noopTools{},
+		Store:     store.NewMemory(),
+		Clock:     systemClock{},
+		Telemetry: tel,
 	})
 	bus := kafkaworker.NewKafkaBus(brokers, kafkaworker.GroupID)
 	defer bus.Close()

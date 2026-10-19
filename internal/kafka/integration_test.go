@@ -65,6 +65,9 @@ func startKafka(t *testing.T) (brokers []string, cleanup func()) {
 }
 
 func TestKafka_happyPathAndDLQ(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires Docker")
+	}
 	brokers, cleanup := startKafka(t)
 	defer cleanup()
 
