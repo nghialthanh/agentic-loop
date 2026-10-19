@@ -4,11 +4,15 @@
 
 **Blocked by:** 05 (Read tool loop and grounded reply)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Guard match stores and returns `guard_blocked` with the fixed refusal
-- [ ] Missing requested account fact after tool failure sets `tool_failed`
-- [ ] Reply on tool failure does not guess missing account facts
-- [ ] Four-tool stop with a missing fact sets `tool_failed` when budget remains
-- [ ] Spent message budget publishes `timeout` and a short reply
-- [ ] Tests cover guard, tool failure, and timeout through the attempt seam
+- [x] Guard match stores and returns `guard_blocked` with the fixed refusal
+- [x] Missing requested account fact after tool failure sets `tool_failed`
+- [x] Reply on tool failure does not guess missing account facts
+- [x] Four-tool stop with a missing fact sets `tool_failed` when budget remains
+- [x] Spent message budget publishes `timeout` and a short reply
+- [x] Tests cover guard, tool failure, and timeout through the attempt seam
+
+## Answer
+
+Attempt seam now runs a fixed pattern-list input guard (refusal + `guard_blocked`, no model/tools), tracks the 30s message budget by deducting tool latency (`timeout` + short reply when spent), and sets `tool_failed` when a requested account fact is still missing after tool failure or a four-tool stop with budget remaining—without inventing missing facts. Covered by attempt-seam tests in `guard_budget_test.go`.
