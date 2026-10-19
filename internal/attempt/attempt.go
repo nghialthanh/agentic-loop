@@ -18,6 +18,16 @@ import (
 // It must not invent account facts.
 const GeneralReply = "I can help with general questions, but I don't have a matching skill for that request."
 
+// GuardRefusal is the fixed reply when the input guard blocks the message.
+const GuardRefusal = "I can't help with that request."
+
+// TimeoutReply is the short reply when the message timeout budget is spent.
+const TimeoutReply = "I can't answer that right now."
+
+// ToolFailedReply is used when a requested account fact is missing and the model
+// reply would invent facts or is empty.
+const ToolFailedReply = "I couldn't complete that lookup right now."
+
 // LowConfidence is the confidence for ungrounded general answers.
 const LowConfidence = 0.2
 
@@ -27,6 +37,9 @@ const GroundedConfidence = 0.8
 // MaxToolExecutions caps tool HTTP calls per attempt.
 const MaxToolExecutions = 4
 
+// MessageBudget is the default per-message timeout budget (spec Further Notes).
+const MessageBudget = 30 * time.Second
+
 // MaxHistoryTurns is the newest-turn cap before the token budget trim.
 const MaxHistoryTurns = 12
 
@@ -35,6 +48,18 @@ const HistoryTokenBudget = 3000
 
 // HistoryOmissionLine marks dropped older turns for this model call only.
 const HistoryOmissionLine = "[Earlier conversation turns were omitted to fit the context budget.]"
+
+// defaultGuardPatterns is the fixed input-guard pattern list (case-insensitive substrings).
+var defaultGuardPatterns = []string{
+	"ignore previous instructions",
+	"ignore all previous",
+	"disregard previous",
+	"jailbreak",
+	"you are now dan",
+	"developer mode",
+	"bypass safety",
+	"system prompt",
+}
 
 // SkillSelectionSystemPrompt is the foundation brief skill-selection system prompt.
 const SkillSelectionSystemPrompt = `You choose skills for a customer-support agent. You do not answer the customer. You do not call tools.
@@ -236,6 +261,23 @@ func (a *Attempt) runValid(ctx context.Context, in contract.InputMessage) (Resul
 		return Result{}, fmt.Errorf("trace id: %w", err)
 	}
 
+	if guardBlocked(in.Content) {
+		return Result{
+			Output: &contract.OutputMessage{
+				MessageID:      in.MessageID,
+				ConversationID: in.ConversationID,
+				Reply:          GuardRefusal,
+				Intent:         "",
+				Skills:         []string{},
+				UsedTools:      []contract.UsedTool{},
+				Confidence:     LowConfidence,
+				Error:          &contract.OutputError{Code: "guard_blocked", Message: "input blocked by guard"},
+				TraceID:        traceID,
+				Model:          "",
+			},
+		}, nil
+	}
+
 	candidates, err := a.deps.Catalog.SearchSkills(ctx, in.Content)
 	if err != nil {
 		return Result{}, fmt.Errorf("search skills: %w", err)
@@ -286,8 +328,46 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 	usedTools := make([]contract.UsedTool, 0)
 	keeps := make([]map[string]any, 0)
 	executions := 0
+	remainingMs := MessageBudget.Milliseconds()
+
+	finish := func(reply string, timedOut, hitToolCap bool) *contract.OutputMessage {
+		missing := missingRequestedAccountFact(in.Content, keeps)
+		var outErr *contract.OutputError
+		confidence := LowConfidence
+
+		switch {
+		case timedOut:
+			reply = TimeoutReply
+			outErr = &contract.OutputError{Code: "timeout", Message: "message budget spent"}
+		case missing:
+			reply = composeMissingFactReply(reply, in.Content, keeps)
+			outErr = &contract.OutputError{Code: "tool_failed", Message: "requested account fact missing"}
+		default:
+			reply = composeGroundedReply(reply, keeps)
+			if len(keeps) > 0 {
+				confidence = GroundedConfidence
+			}
+		}
+		_ = hitToolCap
+		return &contract.OutputMessage{
+			MessageID:      in.MessageID,
+			ConversationID: in.ConversationID,
+			Reply:          reply,
+			Intent:         intent,
+			Skills:         skills,
+			UsedTools:      usedTools,
+			Confidence:     confidence,
+			Error:          outErr,
+			TraceID:        traceID,
+			Model:          "",
+		}
+	}
 
 	for {
+		if remainingMs <= 0 {
+			return finish("", true, false), nil
+		}
+
 		call := ToolCallingCall{
 			System:   ToolCallingSystemPrompt,
 			Messages: messages,
@@ -299,52 +379,25 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 		}
 
 		if len(result.ToolCalls) == 0 {
-			reply := composeGroundedReply(result.Reply, keeps)
-			confidence := LowConfidence
-			if len(keeps) > 0 {
-				confidence = GroundedConfidence
-			}
-			return &contract.OutputMessage{
-				MessageID:      in.MessageID,
-				ConversationID: in.ConversationID,
-				Reply:          reply,
-				Intent:         intent,
-				Skills:         skills,
-				UsedTools:      usedTools,
-				Confidence:     confidence,
-				Error:          nil,
-				TraceID:        traceID,
-				Model:          "",
-			}, nil
+			return finish(result.Reply, false, false), nil
 		}
 
 		if executions >= MaxToolExecutions {
-			reply := composeGroundedReply(result.Reply, keeps)
-			if reply == "" {
-				reply = composeGroundedReply("I looked into that with the tools I could run.", keeps)
+			reply := result.Reply
+			if strings.TrimSpace(reply) == "" {
+				reply = "I looked into that with the tools I could run."
 			}
-			confidence := LowConfidence
-			if len(keeps) > 0 {
-				confidence = GroundedConfidence
-			}
-			return &contract.OutputMessage{
-				MessageID:      in.MessageID,
-				ConversationID: in.ConversationID,
-				Reply:          reply,
-				Intent:         intent,
-				Skills:         skills,
-				UsedTools:      usedTools,
-				Confidence:     confidence,
-				Error:          nil,
-				TraceID:        traceID,
-				Model:          "",
-			}, nil
+			return finish(reply, false, true), nil
 		}
 
 		for _, tc := range result.ToolCalls {
 			if executions >= MaxToolExecutions {
 				break
 			}
+			if remainingMs <= 0 {
+				return finish("", true, false), nil
+			}
+
 			tool, ok := byName[tc.Name]
 			if !ok {
 				usedTools = append(usedTools, contract.UsedTool{
@@ -386,6 +439,12 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 				}
 			}
 
+			latency := httpRes.LatencyMs
+			if latency < 0 {
+				latency = 0
+			}
+			remainingMs -= int64(latency)
+
 			usedTools = append(usedTools, contract.UsedTool{
 				Name:      tool.Name,
 				Status:    status,
@@ -402,6 +461,10 @@ func (a *Attempt) runToolLoop(ctx context.Context, in contract.InputMessage, int
 					Content: observation,
 				},
 			)
+
+			if remainingMs <= 0 {
+				return finish("", true, false), nil
+			}
 		}
 	}
 }
@@ -551,6 +614,107 @@ func composeGroundedReply(modelReply string, keeps []map[string]any) string {
 		return modelReply
 	}
 	return templateFromKeeps(keeps)
+}
+
+func guardBlocked(content string) bool {
+	lower := strings.ToLower(content)
+	for _, pattern := range defaultGuardPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func requestsAccountFacts(content string) bool {
+	lower := strings.ToLower(content)
+	for _, kw := range []string{"order", "refund", "balance", "status", "profile", "shipment", "shipping", "where is"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func requestedOrderIDs(content string) []string {
+	var ids []string
+	seen := map[string]struct{}{}
+	for _, token := range tokenize(content) {
+		if !hasDigit(token) {
+			continue
+		}
+		key := strings.ToLower(token)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		ids = append(ids, key)
+	}
+	return ids
+}
+
+func keepHasOrderID(keeps []map[string]any, orderID string) bool {
+	want := strings.ToLower(orderID)
+	for _, keep := range keeps {
+		if v, ok := keep["order_id"]; ok && strings.ToLower(strings.TrimSpace(fmt.Sprint(v))) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// missingRequestedAccountFact reports whether the latest message asked for an
+// account fact that successful tool keeps did not supply (ADR 0006).
+func missingRequestedAccountFact(content string, keeps []map[string]any) bool {
+	if !requestsAccountFacts(content) {
+		return false
+	}
+	ids := requestedOrderIDs(content)
+	if len(ids) > 0 {
+		for _, id := range ids {
+			if keepHasOrderID(keeps, id) {
+				return false
+			}
+		}
+		return true
+	}
+	return len(keeps) == 0
+}
+
+func composeMissingFactReply(modelReply, content string, _ []map[string]any) string {
+	// Do not present unrelated keep values as the answer. Only allow an honest
+	// model failure sentence that invents no account-fact markers.
+	if strings.TrimSpace(modelReply) == "" || inventsAccountFacts(modelReply, content, nil) {
+		return ToolFailedReply
+	}
+	return modelReply
+}
+
+func inventsAccountFacts(reply, customerContent string, keeps []map[string]any) bool {
+	allowed := allowedFactValues(keeps)
+	for _, token := range tokenize(customerContent) {
+		if hasDigit(token) {
+			allowed[strings.ToLower(token)] = struct{}{}
+		}
+	}
+	lower := strings.ToLower(reply)
+	for _, word := range []string{"balance", "refund", "cancelled", "canceled", "shipped", "delivered", "pending"} {
+		if !strings.Contains(lower, word) {
+			continue
+		}
+		if _, ok := allowed[word]; !ok {
+			return true
+		}
+	}
+	for _, token := range tokenize(reply) {
+		if !hasDigit(token) {
+			continue
+		}
+		if _, ok := allowed[strings.ToLower(token)]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func allowedFactValues(keeps []map[string]any) map[string]struct{} {
