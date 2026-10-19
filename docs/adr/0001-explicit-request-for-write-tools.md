@@ -1,0 +1,3 @@
+# Write tools require an explicit request
+
+The worker can call a write tool in the same attempt as the customer message, and this contract has no confirmation turn. A write tool runs only when the latest message explicitly asks for that change. "Please refund order 1001" may refund after the required read. "I was charged twice. Where is order 1001?" may look up the order and must not refund. Implied intent was rejected because a wrong write moves money and the worker cannot ask "are you sure?" first. The tool-calling prompt carries the rule. The executor does not classify the sentence; that enforcement choice is ADR 0008.
