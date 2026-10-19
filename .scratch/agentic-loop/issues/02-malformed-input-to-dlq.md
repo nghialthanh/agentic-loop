@@ -4,11 +4,15 @@
 
 **Blocked by:** 01 (Module, contracts, and attempt seam)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Schema-invalid payloads go to DLQ only
-- [ ] Empty `content` after trim goes to DLQ only
-- [ ] Unknown `conversation_history[].role` goes to DLQ only
-- [ ] No normal output record is produced for malformed input
-- [ ] No dedupe/claim row is written for malformed input
-- [ ] Tests drive this through the attempt seam
+- [x] Schema-invalid payloads go to DLQ only
+- [x] Empty `content` after trim goes to DLQ only
+- [x] Unknown `conversation_history[].role` goes to DLQ only
+- [x] No normal output record is produced for malformed input
+- [x] No dedupe/claim row is written for malformed input
+- [x] Tests drive this through the attempt seam
+
+## Answer
+
+Attempt seam returns dead letters for empty content, unknown history roles, and schema-invalid JSON (`RunBytes` keeps the original payload). Validation runs before `Store.ClaimMessage`, so malformed input never produces output or a claim. Covered by attempt-seam tests with a recording store.
