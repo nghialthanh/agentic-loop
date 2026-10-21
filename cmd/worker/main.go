@@ -11,14 +11,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/agentic-loop/worker/internal/attempt"
-	"github.com/agentic-loop/worker/internal/catalog"
-	"github.com/agentic-loop/worker/internal/health"
-	kafkaworker "github.com/agentic-loop/worker/internal/kafka"
-	"github.com/agentic-loop/worker/internal/model"
-	"github.com/agentic-loop/worker/internal/observability"
-	"github.com/agentic-loop/worker/internal/store"
-	"github.com/agentic-loop/worker/internal/tools"
+	"github.com/agentic-loop/worker/internal/service/attempt"
+	"github.com/agentic-loop/worker/internal/repository/catalog"
+	"github.com/agentic-loop/worker/internal/adapter/health"
+	kafkaworker "github.com/agentic-loop/worker/internal/adapter/kafka"
+	"github.com/agentic-loop/worker/internal/adapter/model"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
+	"github.com/agentic-loop/worker/internal/repository/store"
+	"github.com/agentic-loop/worker/internal/adapter/tools"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )

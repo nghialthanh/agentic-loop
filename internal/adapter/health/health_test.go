@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agentic-loop/worker/internal/health"
-	"github.com/agentic-loop/worker/internal/observability"
+	"github.com/agentic-loop/worker/internal/adapter/health"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
 )
 
 func TestHealthEndpoint_respondsSuccessfully(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agentic-loop/worker/internal/observability"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
 )
 
 func TestLogger_AttemptInfo_includesIDsAndRedactsPII(t *testing.T) {

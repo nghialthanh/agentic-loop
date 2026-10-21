@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agentic-loop/worker/internal/attempt"
-	"github.com/agentic-loop/worker/internal/catalog"
+	"github.com/agentic-loop/worker/internal/service/attempt"
+	"github.com/agentic-loop/worker/internal/repository/catalog"
 	"github.com/agentic-loop/worker/internal/contract"
 )
 

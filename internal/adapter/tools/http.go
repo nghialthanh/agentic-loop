@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agentic-loop/worker/internal/attempt"
+	"github.com/agentic-loop/worker/internal/service/attempt"
 )
 
 // HTTPExecutor calls tool endpoints over net/http.

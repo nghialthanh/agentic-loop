@@ -6,10 +6,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/agentic-loop/worker/internal/attempt"
+	"github.com/agentic-loop/worker/internal/service/attempt"
 	"github.com/agentic-loop/worker/internal/contract"
-	kafkaworker "github.com/agentic-loop/worker/internal/kafka"
-	"github.com/agentic-loop/worker/internal/store"
+	kafkaworker "github.com/agentic-loop/worker/internal/adapter/kafka"
+	"github.com/agentic-loop/worker/internal/repository/store"
 )
 
 type fakeAttempt struct {

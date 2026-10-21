@@ -1,5 +1,9 @@
 ## Agent skills
 
+### Repo layout
+
+Three layers: `internal/repository` (DAO), `internal/service` (logic), `internal/adapter` (Kafka / HTTP / API). See `docs/structure.md`. Deploy/env: `docs/deploy.md`. Error matrix: `docs/error-handling.md`.
+
 ### Issue tracker
 
 Issues live as markdown files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agentic-loop/worker/internal/observability"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
 )
 
 func TestMetrics_RecordAttempt_exposesLatencyToolsTokensHallucinations(t *testing.T) {

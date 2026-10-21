@@ -8,7 +8,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"github.com/agentic-loop/worker/internal/observability"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
 )
 
 func TestTracer_StartAttempt_createsSpanWithIDsAndRedactsPII(t *testing.T) {

@@ -10,10 +10,10 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/agentic-loop/worker/internal/catalog"
+	"github.com/agentic-loop/worker/internal/repository/catalog"
 	"github.com/agentic-loop/worker/internal/contract"
-	"github.com/agentic-loop/worker/internal/observability"
-	"github.com/agentic-loop/worker/internal/store"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
+	"github.com/agentic-loop/worker/internal/repository/store"
 )
 
 // GeneralReply is the customer-facing text when no skill matches.

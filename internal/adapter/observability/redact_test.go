@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agentic-loop/worker/internal/observability"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
 )
 
 func TestRedactPII_replacesEmailPhoneAndCard(t *testing.T) {

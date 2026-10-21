@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agentic-loop/worker/internal/attempt"
-	"github.com/agentic-loop/worker/internal/catalog"
+	"github.com/agentic-loop/worker/internal/service/attempt"
+	"github.com/agentic-loop/worker/internal/repository/catalog"
 )
 
 func TestRun_guardMatchReturnsFixedRefusalWithoutModelOrTools(t *testing.T) {

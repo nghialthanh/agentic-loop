@@ -10,7 +10,7 @@ import (
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/agentic-loop/worker/internal/catalog"
+	"github.com/agentic-loop/worker/internal/repository/catalog"
 )
 
 var testDB *sql.DB

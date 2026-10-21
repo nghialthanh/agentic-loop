@@ -3,7 +3,7 @@ package health
 import (
 	"net/http"
 
-	"github.com/agentic-loop/worker/internal/observability"
+	"github.com/agentic-loop/worker/internal/adapter/observability"
 )
 
 // Register mounts the health endpoint on mux.

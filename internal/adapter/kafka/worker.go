@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/agentic-loop/worker/internal/attempt"
+	"github.com/agentic-loop/worker/internal/service/attempt"
 	"github.com/agentic-loop/worker/internal/contract"
 )
 

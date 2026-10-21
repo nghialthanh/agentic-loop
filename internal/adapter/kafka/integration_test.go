@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agentic-loop/worker/internal/attempt"
-	"github.com/agentic-loop/worker/internal/catalog"
+	"github.com/agentic-loop/worker/internal/service/attempt"
+	"github.com/agentic-loop/worker/internal/repository/catalog"
 	"github.com/agentic-loop/worker/internal/contract"
-	kafkaworker "github.com/agentic-loop/worker/internal/kafka"
-	"github.com/agentic-loop/worker/internal/store"
+	kafkaworker "github.com/agentic-loop/worker/internal/adapter/kafka"
+	"github.com/agentic-loop/worker/internal/repository/store"
 	segmentio "github.com/segmentio/kafka-go"
 	tcKafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 )

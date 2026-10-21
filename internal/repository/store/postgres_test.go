@@ -12,7 +12,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/agentic-loop/worker/internal/contract"
-	"github.com/agentic-loop/worker/internal/store"
+	"github.com/agentic-loop/worker/internal/repository/store"
 )
 
 var testDB *sql.DB
